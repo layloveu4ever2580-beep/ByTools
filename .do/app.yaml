@@ -1,0 +1,38 @@
+name: bybit-trading-bot
+region: sgp
+
+services:
+  - name: bot
+    dockerfile_path: Dockerfile
+    github:
+      repo: layloveu4ever2580-beep/ByTools
+      branch: main
+      deploy_on_push: true
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    http_port: 8080
+    routes:
+      - path: /
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 15
+      period_seconds: 30
+      timeout_seconds: 10
+      success_threshold: 1
+      failure_threshold: 3
+    envs:
+      - key: BYBIT_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: BYBIT_API_SECRET
+        scope: RUN_TIME
+        type: SECRET
+      - key: BYBIT_TESTNET
+        scope: RUN_TIME
+        value: "false"
+      - key: WEBHOOK_SECRET
+        scope: RUN_TIME
+        type: SECRET
+      - key: ALLOWED_ORIGINS
+        scope: RUN_TIME
+        value: "same-origin"

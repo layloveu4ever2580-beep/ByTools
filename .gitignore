@@ -1,0 +1,11 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+dist/
+.DS_Store
+venv/
+leverage_config.json
+trades_history.json
+.playwright-mcp/
+*.png

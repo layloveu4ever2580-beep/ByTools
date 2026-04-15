@@ -1,0 +1,17 @@
+services:
+  # Single service: Flask serves both API and React dashboard
+  - type: web
+    name: bybit-trading-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: BYBIT_TESTNET
+        value: "false"
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "same-origin"
