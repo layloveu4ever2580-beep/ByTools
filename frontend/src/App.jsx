@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Settings, RefreshCw, DollarSign, TrendingUp, Activity, Waves, Loader2, Plus, Trash2, Coins, Target, Clock, Zap, BarChart3, CalendarDays } from 'lucide-react';
+import { RefreshCw, DollarSign, TrendingUp, Activity, Waves, Loader2, Plus, Trash2, Coins, Target, Clock, Zap, BarChart3, CalendarDays } from 'lucide-react';
 import './App.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -9,7 +9,6 @@ function App() {
   const [settings, setSettings] = useState({ targetProfit: 100, theme: 'light', timezone: 'UTC' });
   const [filter, setFilter] = useState('All');
   const [lastSync, setLastSync] = useState(new Date().toLocaleTimeString());
-  const [showSettings, setShowSettings] = useState(false);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState(null);
@@ -210,21 +209,6 @@ function App() {
     }
   };
 
-  const updateSettings = async (e) => {
-    e.preventDefault();
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(settings),
-      });
-      if (!res.ok) throw new Error('Failed to save settings');
-      setShowSettings(false);
-    } catch (err) {
-      setError(err.message);
-    }
-  };
-
   const formatTime = (timestamp) => {
     if (!timestamp) return '—';
     const date = new Date(timestamp);
@@ -272,9 +256,6 @@ function App() {
           <button className="btn-tp-targets" onClick={() => setShowTpTargets(!showTpTargets)}>
             <Target size={18} /> TP Targets
           </button>
-          <button className="btn-settings" onClick={() => setShowSettings(!showSettings)}>
-            <Settings size={18} /> Settings
-          </button>
         </div>
       </header>
 
@@ -283,24 +264,6 @@ function App() {
           {error}
           <button className="error-dismiss" onClick={() => setError(null)} aria-label="Dismiss error">✕</button>
         </div>
-      )}
-
-      {showSettings && (
-        <section className="settings-panel card">
-          <h2>Bot Settings</h2>
-          <form onSubmit={updateSettings} className="settings-form">
-            <div className="form-group">
-              <label htmlFor="targetProfit">Target Profit ($)</label>
-              <input
-                id="targetProfit"
-                type="number"
-                value={settings.targetProfit}
-                onChange={(e) => setSettings({ ...settings, targetProfit: parseFloat(e.target.value) })}
-              />
-            </div>
-            <button type="submit" className="btn-save">Save Settings</button>
-          </form>
-        </section>
       )}
 
       {showLeverage && (
