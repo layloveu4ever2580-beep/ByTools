@@ -132,7 +132,10 @@ def round_qty(qty, min_qty, qty_step):
     return round(steps * qty_step, 8)
 
 
-settings = {
+# ── Settings persistence ──
+_SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
+
+_DEFAULT_SETTINGS = {
     "targetProfit": 40.0,
     "theme": "dark",
     "timezone": "UTC",
@@ -142,6 +145,36 @@ settings = {
         "swing": {"label": "Swing (4h–1D)", "targetProfit": 100.0, "enabled": True, "symbols": []},
     },
 }
+
+
+def _load_settings():
+    """Load settings from disk, falling back to defaults."""
+    if os.path.exists(_SETTINGS_FILE):
+        try:
+            with open(_SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+                logger.info(f"Loaded settings from disk")
+                # Merge with defaults so new keys are always present
+                merged = dict(_DEFAULT_SETTINGS)
+                merged.update(data)
+                if "tpTargets" in data:
+                    merged["tpTargets"] = data["tpTargets"]
+                return merged
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Failed to load settings file: {e}")
+    return dict(_DEFAULT_SETTINGS)
+
+
+def _save_settings():
+    """Persist settings to disk."""
+    try:
+        with open(_SETTINGS_FILE, "w") as f:
+            json.dump(settings, f, indent=2)
+    except IOError as e:
+        logger.error(f"Failed to save settings: {e}")
+
+
+settings = _load_settings()
 trades = _load_trades()
 
 # Track TP limit orders: { symbol: { "orderId": "...", "side": "Sell", "qty": "..." } }
@@ -536,6 +569,7 @@ def update_settings():
                     "enabled": bool(val.get("enabled", True)),
                     "symbols": syms,
                 }
+    _save_settings()
     return jsonify(settings), 200
 
 
