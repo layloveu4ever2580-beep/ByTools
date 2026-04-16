@@ -13,16 +13,44 @@ TradingView Alert (JSON webhook)
         ├─ Calculates position size from target profit & TP distance
         ├─ Sets leverage per symbol config
         ├─ Places limit entry order with stop-loss on Bybit
-        └─ Background monitor places TP limit order after fill
+        ├─ Background monitor places TP limit order after fill
+        │     └─ Cancels orphaned TP orders when SL hits
+        │
+        └─ Dual-Confirmation Trade Flow
               │
-              └─ Cancels orphaned TP orders when SL hits
+              ├─ Trade 1 (1st confirmation): entry + SL + TP as normal
+              ├─ Trade 2 (2nd confirmation): adds to position
+              │     ├─ SL stays at Trade 1's original SL
+              │     ├─ TP moves to Trade 2's target (full combined qty)
+              │     └─ Trade 1's TP is cancelled and replaced
+              └─ Both trades execute independently — Trade 2 fires
+                    even if Trade 1 hasn't filled yet
 ```
 
 The Pine Script strategy (`4 EMA Fib Strategy`) runs on TradingView, detects setups using 4 EMAs and Fibonacci levels, and sends JSON alerts to the bot's webhook endpoint. The bot then executes the trade on Bybit with proper position sizing.
 
+## Dual-Confirmation Trade Logic
+
+The strategy produces two confirmation signals per setup. The bot handles both:
+
+| | Trade 1 (1st confirmation) | Trade 2 (2nd confirmation) |
+|---|---|---|
+| **Entry** | Limit order at Fib entry level | Limit order at 2nd Fib entry level |
+| **Stop Loss** | Trade 1's SL (Fib-based) | Trade 1's original SL (unchanged) |
+| **Take Profit** | Trade 1's TP target | Trade 2's TP target (replaces Trade 1's TP) |
+| **Qty** | Sized from target profit | Sized from target profit |
+
+After Trade 2 fills, the background monitor:
+1. Cancels Trade 1's TP limit order
+2. Sets the position SL to Trade 1's original SL via `set_trading_stop`
+3. Places a new TP limit at Trade 2's target for the **full combined position size**
+
+If Trade 1 gets stopped out before Trade 2 arrives, the position is cleaned up normally. Trade 2 will still be placed as a fresh Trade 1 if the setup reappears.
+
 ## Features
 
 - **Webhook receiver** — accepts TradingView JSON alerts and places limit orders on Bybit
+- **Dual-confirmation entries** — automatically stacks two trades per setup, managing SL/TP across both
 - **Smart position sizing** — calculates quantity from a target profit dollar amount and TP distance
 - **Per-symbol leverage** — configurable leverage for each trading pair (persisted to disk)
 - **Background order monitor** — polls every 3s to place TP limits after entry fills and cancel orphans
@@ -146,6 +174,10 @@ Runs checks against public and authenticated Bybit endpoints to verify your API 
   "sl": 63800.00
 }
 ```
+
+The bot automatically determines whether this is Trade 1 or Trade 2 based on whether an open position already exists for the symbol on the same side. No extra fields are needed from TradingView.
+
+**Response includes `tradeNum`** (1 or 2) so you can verify which confirmation was processed.
 
 ## API Endpoints
 

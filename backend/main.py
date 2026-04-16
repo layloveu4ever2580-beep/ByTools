@@ -151,6 +151,19 @@ _tp_orders = {}
 # { orderId: { "symbol", "tp_side", "tp_price", "qty" } }
 _pending_entries = {}
 
+# ── Multi-confirmation tracking ──
+# Tracks active positions awaiting a 2nd confirmation entry.
+# { symbol: {
+#     "trade_num": 1 or 2,
+#     "trade1_entry": float,   # Trade 1 limit price (becomes SL after Trade 2 fills)
+#     "trade1_sl": float,      # Trade 1 original SL
+#     "trade1_tp": float,      # Trade 1 TP (used until Trade 2 overrides)
+#     "trade1_qty": float,
+#     "trade1_order_id": str,
+#     "side": "Buy" or "Sell",
+# } }
+_active_positions = {}
+
 
 def _check_order_status(session, symbol, order_id):
     """Check if an order was filled, cancelled, or is still open.
@@ -286,22 +299,85 @@ def background_monitor():
                                 if t["id"] == order_id and t["status"] == "Open":
                                     t["status"] = "Closed"
                             _save_trades()
+                            # Clean up active position tracking
+                            _active_positions.pop(sym, None)
                             continue
 
-                        # Place TP reduce-only limit
-                        tp_qty = str(pos_size)
-                        tp_order_id = _place_tp_limit(
-                            session, sym, info["tp_side"],
-                            tp_qty, info["tp_price"]
-                        )
-                        if tp_order_id:
-                            _tp_orders[sym] = {
-                                "orderId": tp_order_id,
-                                "side": info["tp_side"],
-                                "qty": tp_qty,
-                                "price": info["tp_price"],
-                            }
-                            logger.info(f"[monitor] TP limit placed for {sym}: {tp_order_id}")
+                        is_trade2 = info.get("is_trade2", False)
+
+                        if is_trade2:
+                            # ═══ Trade 2 filled — upgrade the position ═══
+                            trade1_sl = info.get("trade1_sl", 0)
+                            logger.info(f"[monitor] TRADE 2 filled for {sym}. "
+                                        f"Upgrading: SL→{trade1_sl} (Trade1 SL), TP→{info['tp_price']}")
+
+                            # 1. Cancel Trade 1's TP limit order
+                            existing_tp = _tp_orders.get(sym)
+                            if existing_tp:
+                                try:
+                                    logger.info(f"[monitor] Cancelling Trade 1 TP order "
+                                                f"{existing_tp['orderId']} for {sym}")
+                                    bybit_call(session.cancel_order,
+                                               category="linear", symbol=sym,
+                                               orderId=existing_tp["orderId"])
+                                except Exception as e:
+                                    logger.warning(f"[monitor] Cancel Trade1 TP failed {sym}: {e}")
+                                _tp_orders.pop(sym, None)
+
+                            # 2. Update SL on the whole position to Trade 1's original SL
+                            tick_size = get_tick_size(sym)
+                            new_sl = round_price(trade1_sl, tick_size)
+                            try:
+                                logger.info(f"[monitor] Setting position SL for {sym} → {new_sl}")
+                                bybit_call(session.set_trading_stop,
+                                           category="linear", symbol=sym,
+                                           stopLoss=str(new_sl), positionIdx=0)
+                            except Exception as e:
+                                logger.error(f"[monitor] Failed to update SL for {sym}: {e}")
+
+                            # 3. Place new TP at Trade 2's target for FULL position qty
+                            tp_qty = str(pos_size)
+                            tp_order_id = _place_tp_limit(
+                                session, sym, info["tp_side"],
+                                tp_qty, info["tp_price"]
+                            )
+                            if tp_order_id:
+                                _tp_orders[sym] = {
+                                    "orderId": tp_order_id,
+                                    "side": info["tp_side"],
+                                    "qty": tp_qty,
+                                    "price": info["tp_price"],
+                                }
+                                logger.info(f"[monitor] Trade 2 TP placed for {sym}: "
+                                            f"{tp_order_id} @ {info['tp_price']} qty={tp_qty}")
+
+                            # Update trade records with new TP (SL stays at Trade 1's SL)
+                            for t in trades:
+                                if t["ticker"] == sym and t["status"] == "Open":
+                                    t["sl"] = trade1_sl
+                                    t["tp"] = info["tp_price"]
+                            _save_trades()
+
+                            # Mark position as fully set up (both trades in)
+                            if sym in _active_positions:
+                                _active_positions[sym]["trade_num"] = 2
+                                _active_positions[sym]["fully_entered"] = True
+
+                        else:
+                            # ═══ Trade 1 filled — place TP as before ═══
+                            tp_qty = str(pos_size)
+                            tp_order_id = _place_tp_limit(
+                                session, sym, info["tp_side"],
+                                tp_qty, info["tp_price"]
+                            )
+                            if tp_order_id:
+                                _tp_orders[sym] = {
+                                    "orderId": tp_order_id,
+                                    "side": info["tp_side"],
+                                    "qty": tp_qty,
+                                    "price": info["tp_price"],
+                                }
+                                logger.info(f"[monitor] Trade 1 TP placed for {sym}: {tp_order_id}")
                         continue
 
                     # status == "Unknown" — order might still be processing
@@ -330,6 +406,8 @@ def background_monitor():
                                 for t in trades:
                                     if t["ticker"] == sym and t["status"] == "Open":
                                         t["status"] = "Closed"
+                                # Clean up active position tracking
+                                _active_positions.pop(sym, None)
                                 _save_trades()
                 except Exception as e:
                     logger.warning(f"[monitor] Orphan check error: {e}")
@@ -586,54 +664,168 @@ def webhook():
         limit_price = round_price(entry, tick_size)
         tp_price = round_price(tp, tick_size)
 
-        # Place LIMIT entry with SL attached (NO TP — TP will be a separate limit order)
-        logger.info(f"Placing LIMIT {side}: {ticker} qty={quantity} price={limit_price} sl={sl}")
-        order = bybit_call(get_session().place_order,
-                           category="linear", symbol=ticker, side=side,
-                           orderType="Limit", qty=str(quantity),
-                           price=str(limit_price), stopLoss=str(sl),
-                           timeInForce="GTC")
-        logger.info(f"Entry response: {order}")
+        # ── Determine if this is Trade 1 (new) or Trade 2 (add to existing) ──
+        existing = _active_positions.get(ticker)
+        is_trade2 = (existing is not None
+                     and existing.get("trade_num") == 1
+                     and existing.get("side") == side)
 
-        if order.get("retCode", -1) != 0:
-            error_msg = order.get("retMsg", "Unknown error")
-            logger.error(f"Entry rejected: {error_msg}")
+        if is_trade2:
+            # ═══════════════════════════════════════════════════════════
+            # TRADE 2: Second confirmation — add to position
+            # SL moves to Trade 1's entry, TP becomes Trade 2's target
+            # ═══════════════════════════════════════════════════════════
+            trade1_entry = existing["trade1_entry"]
+            trade1_sl = existing["trade1_sl"]
+            logger.info(f"[TRADE2] {ticker}: Adding to position. "
+                        f"Trade1 entry={trade1_entry}, Trade2 entry={limit_price}, "
+                        f"New SL={trade1_sl} (Trade1 SL), New TP={tp_price}")
+
+            # Place Trade 2 limit entry with SL at Trade 1's original SL
+            sl_for_trade2 = round_price(trade1_sl, tick_size)
+            logger.info(f"[TRADE2] Placing LIMIT {side}: {ticker} qty={quantity} "
+                        f"price={limit_price} sl={sl_for_trade2}")
+            order = bybit_call(get_session().place_order,
+                               category="linear", symbol=ticker, side=side,
+                               orderType="Limit", qty=str(quantity),
+                               price=str(limit_price), stopLoss=str(sl_for_trade2),
+                               timeInForce="GTC")
+            logger.info(f"[TRADE2] Entry response: {order}")
+
+            if order.get("retCode", -1) != 0:
+                error_msg = order.get("retMsg", "Unknown error")
+                logger.error(f"[TRADE2] Entry rejected: {error_msg}")
+                trades.append({
+                    "id": "failed", "ticker": ticker, "side": side,
+                    "entry": limit_price, "tp": tp, "sl": sl_for_trade2,
+                    "quantity": quantity, "leverage": leverage,
+                    "status": "Failed", "pnl": 0.0,
+                    "tradeNum": 2,
+                    "timeframe": matched_tf or "global",
+                    "targetProfit": target_profit,
+                    "timestamp": int(time.time() * 1000), "error": error_msg
+                })
+                _save_trades()
+                return jsonify({"error": error_msg}), 400
+
+            entry_order_id = order["result"].get("orderId", "")
+            tp_side = "Sell" if side == "Buy" else "Buy"
+
+            # Track Trade 2 pending entry — monitor will:
+            #   1. Cancel Trade 1's TP limit
+            #   2. Update SL on the whole position to Trade 1's entry
+            #   3. Place new TP at Trade 2's target for the full combined qty
+            _pending_entries[entry_order_id] = {
+                "symbol": ticker,
+                "tp_side": tp_side,
+                "tp_price": tp_price,
+                "qty": str(quantity),
+                "is_trade2": True,
+                "trade1_entry": trade1_entry,
+                "trade1_sl": existing.get("trade1_sl"),
+                "trade1_qty": existing.get("trade1_qty"),
+            }
+
+            # Update active position tracking
+            _active_positions[ticker]["trade_num"] = 2
+            _active_positions[ticker]["trade2_order_id"] = entry_order_id
+            _active_positions[ticker]["trade2_entry"] = limit_price
+            _active_positions[ticker]["trade2_tp"] = tp_price
+            _active_positions[ticker]["trade2_qty"] = quantity
+
+            logger.info(f"[TRADE2] Pending for {ticker}: after {entry_order_id} fills → "
+                        f"cancel Trade1 TP, set SL={sl_for_trade2}, TP={tp_price}")
+
             trades.append({
-                "id": "failed", "ticker": ticker, "side": side,
-                "entry": limit_price, "tp": tp, "sl": sl,
-                "quantity": quantity, "leverage": leverage,
-                "status": "Failed", "pnl": 0.0,
+                "id": entry_order_id,
+                "ticker": ticker, "side": side, "entry": limit_price,
+                "tp": tp, "sl": sl_for_trade2, "quantity": quantity,
+                "leverage": leverage, "status": "Open", "pnl": 0.0,
+                "entryType": "limit",
+                "tpType": "limit",
+                "tradeNum": 2,
                 "timeframe": matched_tf or "global",
                 "targetProfit": target_profit,
-                "timestamp": int(time.time() * 1000), "error": error_msg
+                "timestamp": int(time.time() * 1000)
             })
             _save_trades()
-            return jsonify({"error": error_msg}), 400
+            return jsonify({
+                "status": "success", "order": order,
+                "entryType": "limit", "tpType": "limit",
+                "tradeNum": 2,
+                "note": f"Trade 2 placed. After fill: SL→{sl_for_trade2}, TP→{tp_price}"
+            }), 200
 
-        # Track entry so monitor places TP limit after fill
-        entry_order_id = order["result"].get("orderId", "")
-        tp_side = "Sell" if side == "Buy" else "Buy"
-        _pending_entries[entry_order_id] = {
-            "symbol": ticker,
-            "tp_side": tp_side,
-            "tp_price": tp_price,
-            "qty": str(quantity),
-        }
-        logger.info(f"Pending TP for {ticker}: after entry {entry_order_id} fills → {tp_side} limit @ {tp_price}")
+        else:
+            # ═══════════════════════════════════════════════════════════
+            # TRADE 1: First confirmation — standard entry
+            # ═══════════════════════════════════════════════════════════
+            logger.info(f"[TRADE1] Placing LIMIT {side}: {ticker} qty={quantity} "
+                        f"price={limit_price} sl={sl}")
+            order = bybit_call(get_session().place_order,
+                               category="linear", symbol=ticker, side=side,
+                               orderType="Limit", qty=str(quantity),
+                               price=str(limit_price), stopLoss=str(sl),
+                               timeInForce="GTC")
+            logger.info(f"[TRADE1] Entry response: {order}")
 
-        trades.append({
-            "id": entry_order_id,
-            "ticker": ticker, "side": side, "entry": limit_price,
-            "tp": tp, "sl": sl, "quantity": quantity,
-            "leverage": leverage, "status": "Open", "pnl": 0.0,
-            "entryType": "limit",
-            "tpType": "limit",
-            "timeframe": matched_tf or "global",
-            "targetProfit": target_profit,
-            "timestamp": int(time.time() * 1000)
-        })
-        _save_trades()
-        return jsonify({"status": "success", "order": order, "entryType": "limit", "tpType": "limit"}), 200
+            if order.get("retCode", -1) != 0:
+                error_msg = order.get("retMsg", "Unknown error")
+                logger.error(f"[TRADE1] Entry rejected: {error_msg}")
+                trades.append({
+                    "id": "failed", "ticker": ticker, "side": side,
+                    "entry": limit_price, "tp": tp, "sl": sl,
+                    "quantity": quantity, "leverage": leverage,
+                    "status": "Failed", "pnl": 0.0,
+                    "tradeNum": 1,
+                    "timeframe": matched_tf or "global",
+                    "targetProfit": target_profit,
+                    "timestamp": int(time.time() * 1000), "error": error_msg
+                })
+                _save_trades()
+                return jsonify({"error": error_msg}), 400
+
+            entry_order_id = order["result"].get("orderId", "")
+            tp_side = "Sell" if side == "Buy" else "Buy"
+            _pending_entries[entry_order_id] = {
+                "symbol": ticker,
+                "tp_side": tp_side,
+                "tp_price": tp_price,
+                "qty": str(quantity),
+            }
+            logger.info(f"[TRADE1] Pending TP for {ticker}: after {entry_order_id} fills → "
+                        f"{tp_side} limit @ {tp_price}")
+
+            # Register as Trade 1 — waiting for potential Trade 2
+            _active_positions[ticker] = {
+                "trade_num": 1,
+                "trade1_entry": limit_price,
+                "trade1_sl": sl,
+                "trade1_tp": tp_price,
+                "trade1_qty": quantity,
+                "trade1_order_id": entry_order_id,
+                "side": side,
+            }
+
+            trades.append({
+                "id": entry_order_id,
+                "ticker": ticker, "side": side, "entry": limit_price,
+                "tp": tp, "sl": sl, "quantity": quantity,
+                "leverage": leverage, "status": "Open", "pnl": 0.0,
+                "entryType": "limit",
+                "tpType": "limit",
+                "tradeNum": 1,
+                "timeframe": matched_tf or "global",
+                "targetProfit": target_profit,
+                "timestamp": int(time.time() * 1000)
+            })
+            _save_trades()
+            return jsonify({
+                "status": "success", "order": order,
+                "entryType": "limit", "tpType": "limit",
+                "tradeNum": 1,
+                "note": "Trade 1 placed. Awaiting Trade 2 confirmation."
+            }), 200
 
     except Exception as e:
         logger.exception(f"Webhook error: {e}")
