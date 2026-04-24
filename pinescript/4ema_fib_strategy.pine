@@ -253,8 +253,8 @@ if buy_confirmed
     float fib_entry = fib_0 + (fib_range * calc_fib_entry)
     float take_profit = fib_0 + (fib_range * calc_fib_tp)
     float stop_loss   = fib_0 + (fib_range * calc_fib_sl)
-    // If confirmation candle closed below fib entry, use close to avoid a higher limit price
-    float entry_price = math.min(fib_entry, close)
+    // Always use the exact Fib entry price for the limit order
+    float entry_price = fib_entry
     float pos_size = (trade_amt * leverage) / entry_price
 
     pending_buy_tp := take_profit
@@ -284,8 +284,8 @@ if sell_confirmed
     float fib_entry = fib_0 - (fib_range * calc_fib_entry)
     float take_profit = fib_0 - (fib_range * calc_fib_tp)
     float stop_loss   = fib_0 - (fib_range * calc_fib_sl)
-    // If confirmation candle closed above fib entry, use close to avoid a lower limit price
-    float entry_price = math.max(fib_entry, close)
+    // Always use the exact Fib entry price for the limit order
+    float entry_price = fib_entry
     float pos_size = (trade_amt * leverage) / entry_price
 
     pending_sell_tp := take_profit
