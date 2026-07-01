@@ -27,6 +27,15 @@ _DEFAULT_CONFIG = {
     "ICXUSDT": 25,
     "COMPUSDT": 25,
     "VIRTUALUSDT": 50,
+    "AVNTUSDT": 20,
+    "BREVUSDT": 50,
+    "IMXUSDT": 50,
+    "MMTUSDT": 25,
+    "RIVERUSDT": 25,
+    "XPLUSDT": 75,
+    "PAXGUSDT": 60,
+    "TRXUSDT": 60,
+    "MNTUSDT": 25,
 }
 
 
