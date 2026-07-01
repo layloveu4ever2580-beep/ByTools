@@ -578,14 +578,31 @@ def get_leverage():
     return jsonify(LEVERAGE_CONFIG), 200
 
 
+import re as _re
+_SYMBOL_RE = _re.compile(r"^[A-Z0-9]+$")
+
+
 @app.route("/api/leverage", methods=["POST"])
 def add_leverage():
     """Add or update a symbol's leverage. Body: { "symbol": "BTCUSDT", "leverage": 50 }"""
     data = request.json
-    symbol = (data.get("symbol") or "").strip().upper()
+    raw_symbol = (data.get("symbol") or "").strip().upper()
     leverage = data.get("leverage")
+
+    # Accept "SYMBOL*60", "SYMBOL,60", "SYMBOL 60", "SYMBOL:60" as a convenience
+    # by splitting off the leverage if it was pasted directly into the symbol field.
+    split_match = _re.match(r"^([A-Z0-9]+)[\*,:\s]+(\d+)$", raw_symbol)
+    if split_match:
+        symbol = split_match.group(1)
+        if leverage is None:
+            leverage = split_match.group(2)
+    else:
+        symbol = raw_symbol
+
     if not symbol or leverage is None:
         return jsonify({"error": "symbol and leverage are required"}), 400
+    if not _SYMBOL_RE.match(symbol):
+        return jsonify({"error": f"Invalid symbol '{symbol}'. Use letters/numbers only, e.g. BTCUSDT"}), 400
     try:
         leverage = int(leverage)
     except (ValueError, TypeError):

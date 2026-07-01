@@ -74,11 +74,22 @@ function App() {
     if (!newSymbol.trim()) return;
     setLeverageLoading(true);
     setError(null);
+
+    // Allow pasting "SYMBOL*60", "SYMBOL,60", "SYMBOL:60" or "SYMBOL 60"
+    // directly into the symbol field as a convenience.
+    let symbolToSend = newSymbol.trim();
+    let leverageToSend = newLeverage;
+    const splitMatch = symbolToSend.match(/^([A-Z0-9]+)[*,:\s]+(\d+)$/);
+    if (splitMatch) {
+      symbolToSend = splitMatch[1];
+      leverageToSend = parseInt(splitMatch[2], 10);
+    }
+
     try {
       const res = await fetch(`${API_BASE_URL}/api/leverage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: newSymbol.trim(), leverage: newLeverage }),
+        body: JSON.stringify({ symbol: symbolToSend, leverage: leverageToSend }),
       });
       if (!res.ok) {
         const err = await res.json();
