@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback } from 'react';
-import { RefreshCw, DollarSign, TrendingUp, Activity, Waves, Loader2, Plus, Trash2, Coins, Target, Clock, Zap, BarChart3, CalendarDays } from 'lucide-react';
+import { RefreshCw, DollarSign, TrendingUp, Activity, Waves, Loader2, Plus, Trash2, Coins, Target, Clock, Zap, BarChart3, CalendarDays, LayoutDashboard, SlidersHorizontal } from 'lucide-react';
+import Optimizer from './Optimizer.jsx';
 import './App.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
 function App() {
+  const [view, setView] = useState('dashboard'); // 'dashboard' | 'optimizer'
   const [trades, setTrades] = useState([]);
   const [settings, setSettings] = useState({ targetProfit: 100, theme: 'light', timezone: 'UTC' });
   const [filter, setFilter] = useState('All');
@@ -261,14 +263,37 @@ function App() {
           <button className="theme-toggle" onClick={toggleTheme} aria-label="Toggle theme">
             {settings.theme === 'dark' ? '🌙' : '☀️'}
           </button>
-          <button className="btn-leverage" onClick={() => setShowLeverage(!showLeverage)}>
-            <Coins size={18} /> Leverage
-          </button>
-          <button className="btn-tp-targets" onClick={() => setShowTpTargets(!showTpTargets)}>
-            <Target size={18} /> TP Targets
-          </button>
+          {view === 'dashboard' && (
+            <>
+              <button className="btn-leverage" onClick={() => setShowLeverage(!showLeverage)}>
+                <Coins size={18} /> Leverage
+              </button>
+              <button className="btn-tp-targets" onClick={() => setShowTpTargets(!showTpTargets)}>
+                <Target size={18} /> TP Targets
+              </button>
+            </>
+          )}
         </div>
       </header>
+
+      <nav className="view-switch" role="tablist">
+        <button
+          role="tab"
+          aria-selected={view === 'dashboard'}
+          className={`view-switch-btn ${view === 'dashboard' ? 'active' : ''}`}
+          onClick={() => setView('dashboard')}
+        >
+          <LayoutDashboard size={16} /> Dashboard
+        </button>
+        <button
+          role="tab"
+          aria-selected={view === 'optimizer'}
+          className={`view-switch-btn ${view === 'optimizer' ? 'active' : ''}`}
+          onClick={() => setView('optimizer')}
+        >
+          <SlidersHorizontal size={16} /> Optimizer
+        </button>
+      </nav>
 
       {error && (
         <div className="error-banner" role="alert">
@@ -277,7 +302,9 @@ function App() {
         </div>
       )}
 
-      {showLeverage && (
+      {view === 'optimizer' && <Optimizer />}
+
+      {view === 'dashboard' && showLeverage && (
         <section className="leverage-panel card">
           <h2>Leverage Config</h2>
           <p className="leverage-subtitle">Manage trading pairs and their leverage multipliers</p>
@@ -334,7 +361,7 @@ function App() {
         </section>
       )}
 
-      {showTpTargets && (
+      {view === 'dashboard' && showTpTargets && (
         <section className="tp-targets-panel card">
           <div className="tp-targets-header">
             <div>
@@ -444,6 +471,7 @@ function App() {
         </section>
       )}
 
+      {view === 'dashboard' && (
       <main className="dashboard-content">
         <div className="stats-row">
           <div className="stat-card">
@@ -540,27 +568,27 @@ function App() {
                     const displayTarget = t.targetProfit ?? settings.targetProfit;
                     return (
                     <tr key={t.id || idx}>
-                      <td className="font-medium">{t.ticker}</td>
-                      <td>
+                      <td className="font-medium" data-label="Ticker">{t.ticker}</td>
+                      <td data-label="Action">
                         <span className={`badge ${t.side?.toLowerCase() === 'buy' ? 'bg-green' : 'bg-red'}`}>
                           {t.side?.toUpperCase() || 'BUY'}
                         </span>
                       </td>
-                      <td>{t.entry}</td>
-                      <td>{t.exitPrice ? t.exitPrice : '—'}</td>
-                      <td>{t.tp} / {t.sl}</td>
-                      <td>${displayTarget}</td>
-                      <td><span className={`badge tf-badge ${tfColors[tfKey] || 'tf-badge-global'}`}>{tfLabels[tfKey] || tfKey}</span></td>
-                      <td>{t.quantity?.toFixed(4)}</td>
-                      <td>{t.leverage || '—'}x</td>
-                      <td className={t.pnl >= 0 ? (t.pnl === 0 ? 'text-neutral' : 'text-green') : 'text-red'}>
+                      <td data-label="Entry">{t.entry}</td>
+                      <td data-label="Exit">{t.exitPrice ? t.exitPrice : '—'}</td>
+                      <td data-label="TP / SL">{t.tp} / {t.sl}</td>
+                      <td data-label="Target $">${displayTarget}</td>
+                      <td data-label="TF"><span className={`badge tf-badge ${tfColors[tfKey] || 'tf-badge-global'}`}>{tfLabels[tfKey] || tfKey}</span></td>
+                      <td data-label="Qty">{t.quantity?.toFixed(4)}</td>
+                      <td data-label="Leverage">{t.leverage || '—'}x</td>
+                      <td data-label="PnL" className={t.pnl >= 0 ? (t.pnl === 0 ? 'text-neutral' : 'text-green') : 'text-red'}>
                         ${t.pnl?.toFixed(2) ?? '0.00'}
                         {t.status === 'Closed' && t.closedAt ? <span className="pnl-realized"> ✓</span> : ''}
                       </td>
-                      <td>
+                      <td data-label="Status">
                         <span className={`status-text ${t.status?.toLowerCase()}`}>{t.status}</span>
                       </td>
-                      <td className="text-sm text-gray">
+                      <td className="text-sm text-gray" data-label="Time">
                         {t.status === 'Closed' && t.closedAt ? formatTime(t.closedAt) : formatTime(t.timestamp)}
                       </td>
                     </tr>
@@ -577,6 +605,7 @@ function App() {
           )}
         </section>
       </main>
+      )}
     </div>
   );
 }

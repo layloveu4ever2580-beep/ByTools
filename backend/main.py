@@ -8,6 +8,7 @@ from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 from flask_cors import CORS
 from leverage_config import LEVERAGE_CONFIG, save_leverage_config
+from optimizer_broker import opt_bp, init_broker
 
 load_dotenv()
 
@@ -51,6 +52,10 @@ if _raw_origins in ("same-origin", "*", ""):
     CORS(app)
 else:
     CORS(app, origins=_raw_origins.split(","))
+
+# ── Optimizer broker (remote-control bridge for the desktop extension) ──
+init_broker(_DATA_DIR)
+app.register_blueprint(opt_bp)
 
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
