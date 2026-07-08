@@ -61,7 +61,6 @@ BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
 PORT = int(os.getenv("PORT", 5001))
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 _session = None
 
@@ -644,18 +643,9 @@ def delete_leverage(symbol):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if WEBHOOK_SECRET and WEBHOOK_SECRET != "your_webhook_secret_here":
-        # Accept the secret via (in order): X-Webhook-Secret header, a ?secret=
-        # URL query param, or a "secret" field in the JSON body. The query-param
-        # option lets TradingView authenticate without putting the secret in the
-        # (public) Pine script — use https://<host>/webhook?secret=<secret>.
-        provided = (request.headers.get("X-Webhook-Secret", "")
-                    or request.args.get("secret", ""))
-        if provided != WEBHOOK_SECRET:
-            body = request.get_json(silent=True) or {}
-            if body.get("secret") != WEBHOOK_SECRET:
-                return jsonify({"error": "Unauthorized"}), 401
-
+    # No authentication — the webhook is open. Anyone who can reach this
+    # endpoint can place trades, so restrict inbound access at the firewall
+    # (e.g. allow only TradingView's IPs) if that matters.
     try:
         data = request.get_json(silent=True)
         if data is None:
