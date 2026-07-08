@@ -448,6 +448,34 @@ def background_monitor():
                         _save_trades()
                         _open_trades.pop(entry_id, None)
 
+            # ── 3. Safety net: if a symbol's position is fully gone but we
+            #      still track open trades for it, close them and cancel any
+            #      leftover exit orders (covers a missed fill detection).
+            if _open_trades:
+                try:
+                    positions = bybit_call(session.get_positions,
+                                           category="linear", settleCoin="USDT")
+                    if positions.get("retCode") == 0:
+                        pos_list = positions.get("result", {}).get("list", [])
+                        open_syms = {p.get("symbol") for p in pos_list
+                                     if float(p.get("size", 0)) > 0}
+                        for entry_id in list(_open_trades.keys()):
+                            tr = _open_trades.get(entry_id)
+                            if not tr or tr["symbol"] in open_syms:
+                                continue
+                            sym = tr["symbol"]
+                            logger.info(f"[monitor] Position gone for {sym}; closing "
+                                        f"tracked trade {tr.get('trade_uid')}")
+                            _cancel_order_safe(session, sym, tr.get("tp_order_id"), "TP")
+                            _cancel_order_safe(session, sym, tr.get("sl_order_id"), "SL")
+                            for t in trades:
+                                if t["id"] == entry_id and t["status"] == "Open":
+                                    t["status"] = "Closed"
+                            _save_trades()
+                            _open_trades.pop(entry_id, None)
+                except Exception as e:
+                    logger.warning(f"[monitor] Position sweep error: {e}")
+
             # ── Periodically sync closed PnL (every 60s) ──
             now = time.time()
             if now - _last_pnl_sync > 60:
@@ -612,8 +640,13 @@ def delete_leverage(symbol):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if WEBHOOK_SECRET and WEBHOOK_SECRET != "your_webhook_secret_here":
-        token = request.headers.get("X-Webhook-Secret", "")
-        if token != WEBHOOK_SECRET:
+        # Accept the secret via (in order): X-Webhook-Secret header, a ?secret=
+        # URL query param, or a "secret" field in the JSON body. The query-param
+        # option lets TradingView authenticate without putting the secret in the
+        # (public) Pine script — use https://<host>/webhook?secret=<secret>.
+        provided = (request.headers.get("X-Webhook-Secret", "")
+                    or request.args.get("secret", ""))
+        if provided != WEBHOOK_SECRET:
             body = request.get_json(silent=True) or {}
             if body.get("secret") != WEBHOOK_SECRET:
                 return jsonify({"error": "Unauthorized"}), 401
@@ -710,6 +743,15 @@ def webhook():
         # ═══════════════════════════════════════════════════════════════
         sl_price = round_price(sl, tick_size)
         trade_uid = str(data.get("id") or f"{side}_{int(time.time() * 1000)}")
+
+        # Idempotency: ignore a repeated signal for a trade id we're already
+        # handling (TradingView can retry or re-fire the same alert).
+        if data.get("id"):
+            already = (any(p.get("trade_uid") == trade_uid for p in _pending_entries.values())
+                       or any(o.get("trade_uid") == trade_uid for o in _open_trades.values()))
+            if already:
+                logger.info(f"[ENTRY] Duplicate signal for {trade_uid}, ignoring")
+                return jsonify({"status": "ignored", "reason": "duplicate trade id"}), 200
 
         logger.info(f"[ENTRY] {trade_uid} Placing LIMIT {side}: {ticker} "
                     f"qty={quantity} price={limit_price} tp={tp_price} sl={sl_price}")

@@ -33,4 +33,7 @@ RUN mkdir -p /app/data
 
 EXPOSE 8080
 
-CMD ["gunicorn", "main:app", "-b", "0.0.0.0:8080", "--workers", "2", "--timeout", "120"]
+# IMPORTANT: single worker only. All trade state and the background order
+# monitor live in process memory, so multiple workers would each run their own
+# monitor and clobber trades_history.json. Use threads for concurrency instead.
+CMD ["gunicorn", "main:app", "-b", "0.0.0.0:8080", "--workers", "1", "--threads", "4", "--timeout", "120"]
