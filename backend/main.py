@@ -177,25 +177,24 @@ def _save_settings():
 settings = _load_settings()
 trades = _load_trades()
 
-# Track TP limit orders: { symbol: { "orderId": "...", "side": "Sell", "qty": "..." } }
-_tp_orders = {}
+# ── Per-trade tracking (software-managed, fully independent TP/SL) ──
+# Every signal becomes an independent trade. Each trade gets its OWN
+# reduce-only TP limit order and its OWN reduce-only conditional stop (SL)
+# order, so multiple simultaneous trades on the same symbol keep completely
+# separate TP and SL levels. There is no netting/merging of trades.
 
-# Pending entries waiting for fill to place TP limit
-# { orderId: { "symbol", "tp_side", "tp_price", "qty" } }
+# Entries waiting to fill. Keyed by the entry order id.
+# { entry_order_id: {
+#     "symbol", "side", "tp_side", "tp_price", "sl_price", "qty", "trade_uid"
+# } }
 _pending_entries = {}
 
-# ── Multi-confirmation tracking ──
-# Tracks active positions awaiting a 2nd confirmation entry.
-# { symbol: {
-#     "trade_num": 1 or 2,
-#     "trade1_entry": float,   # Trade 1 limit price (becomes SL after Trade 2 fills)
-#     "trade1_sl": float,      # Trade 1 original SL
-#     "trade1_tp": float,      # Trade 1 TP (used until Trade 2 overrides)
-#     "trade1_qty": float,
-#     "trade1_order_id": str,
-#     "side": "Buy" or "Sell",
+# Live trades with their exit orders placed. Keyed by the entry order id.
+# { entry_order_id: {
+#     "symbol", "side", "qty", "tp_price", "sl_price", "tp_side",
+#     "tp_order_id", "sl_order_id", "trade_uid"
 # } }
-_active_positions = {}
+_open_trades = {}
 
 
 def _check_order_status(session, symbol, order_id):
@@ -239,7 +238,12 @@ def _check_order_status(session, symbol, order_id):
 
 
 def _place_tp_limit(session, symbol, side, qty, price, retry=True):
-    """Place a reduce-only limit order as TP. Returns orderId or None."""
+    """Place a reduce-only limit order as this trade's TP. Returns orderId or None.
+
+    Note: NO position-level trading-stop fallback here. Position-level TP/SL is
+    global to the whole netted position and would destroy per-trade separation,
+    so each trade only ever uses its own reduce-only order.
+    """
     logger.info(f"[TP] Placing {side} reduce-only limit: {symbol} qty={qty} @ {price}")
     try:
         tp_ord = bybit_call(session.place_order,
@@ -250,20 +254,11 @@ def _place_tp_limit(session, symbol, side, qty, price, retry=True):
         logger.info(f"[TP] Response: retCode={tp_ord.get('retCode')} retMsg={tp_ord.get('retMsg')}")
         if tp_ord.get("retCode") == 0:
             return tp_ord["result"].get("orderId", "")
-        # Retry once after a short pause
         if retry:
             logger.info(f"[TP] Retrying TP limit for {symbol} in 1s...")
             time.sleep(1)
             return _place_tp_limit(session, symbol, side, qty, price, retry=False)
-        # Last resort: fall back to trading stop
-        logger.warning(f"[TP] Limit failed for {symbol}, falling back to trading stop")
-        try:
-            bybit_call(session.set_trading_stop,
-                       category="linear", symbol=symbol,
-                       takeProfit=str(price), positionIdx=0)
-            logger.info(f"[TP] Trading stop TP set for {symbol} @ {price}")
-        except Exception as e2:
-            logger.error(f"[TP] Trading stop also failed for {symbol}: {e2}")
+        logger.error(f"[TP] Limit failed for {symbol}: {tp_ord.get('retMsg')}")
         return None
     except Exception as e:
         logger.error(f"[TP] Exception placing TP for {symbol}: {e}")
@@ -271,6 +266,59 @@ def _place_tp_limit(session, symbol, side, qty, price, retry=True):
             time.sleep(1)
             return _place_tp_limit(session, symbol, side, qty, price, retry=False)
         return None
+
+
+def _place_sl_stop(session, symbol, side, qty, trigger_price, position_side, retry=True):
+    """Place a reduce-only conditional stop-market order as this trade's SL.
+
+    Each trade gets its own SL order (instead of a single position-level stop),
+    so multiple trades on one symbol keep independent stop levels.
+
+    `side` is the closing side (opposite of the entry side). `position_side`
+    is the entry side ("Buy"/"Sell") used to derive the trigger direction:
+      - Long  (Buy):  SL is below → trigger when price falls  → triggerDirection=2
+      - Short (Sell): SL is above → trigger when price rises   → triggerDirection=1
+    Returns orderId or None.
+    """
+    trigger_dir = 2 if position_side == "Buy" else 1
+    logger.info(f"[SL] Placing {side} reduce-only stop: {symbol} qty={qty} "
+                f"trigger@{trigger_price} dir={trigger_dir}")
+    try:
+        sl_ord = bybit_call(session.place_order,
+                            category="linear", symbol=symbol,
+                            side=side, orderType="Market", qty=str(qty),
+                            triggerPrice=str(trigger_price), triggerBy="LastPrice",
+                            triggerDirection=trigger_dir, reduceOnly=True,
+                            timeInForce="GTC")
+        logger.info(f"[SL] Response: retCode={sl_ord.get('retCode')} retMsg={sl_ord.get('retMsg')}")
+        if sl_ord.get("retCode") == 0:
+            return sl_ord["result"].get("orderId", "")
+        if retry:
+            logger.info(f"[SL] Retrying SL stop for {symbol} in 1s...")
+            time.sleep(1)
+            return _place_sl_stop(session, symbol, side, qty, trigger_price,
+                                  position_side, retry=False)
+        logger.error(f"[SL] Stop failed for {symbol}: {sl_ord.get('retMsg')}")
+        return None
+    except Exception as e:
+        logger.error(f"[SL] Exception placing SL for {symbol}: {e}")
+        if retry:
+            time.sleep(1)
+            return _place_sl_stop(session, symbol, side, qty, trigger_price,
+                                  position_side, retry=False)
+        return None
+
+
+def _cancel_order_safe(session, symbol, order_id, tag=""):
+    """Cancel an order, ignoring errors (e.g. already filled/cancelled)."""
+    if not order_id:
+        return
+    try:
+        bybit_call(session.cancel_order, category="linear",
+                   symbol=symbol, orderId=order_id)
+        logger.info(f"[cancel] {tag} order {order_id} for {symbol} cancelled")
+    except Exception as e:
+        logger.warning(f"[cancel] {tag} order {order_id} for {symbol} failed: {e}")
 
 
 def background_monitor():
@@ -285,7 +333,7 @@ def background_monitor():
             time.sleep(3)
             session = get_session()
 
-            # ── Check pending entries for fills ──
+            # ── 1. Check pending entries for fills → place this trade's TP + SL ──
             if _pending_entries:
                 for order_id in list(_pending_entries.keys()):
                     info = _pending_entries.get(order_id)
@@ -310,7 +358,7 @@ def background_monitor():
                     if status == "Filled":
                         _pending_entries.pop(order_id, None)
 
-                        # Get actual position size for TP qty
+                        # Confirm a position actually exists for the symbol.
                         try:
                             pos = bybit_call(session.get_positions,
                                              category="linear", symbol=sym)
@@ -326,142 +374,79 @@ def background_monitor():
                             pos_size = float(info.get("qty", 0))
 
                         if pos_size <= 0:
-                            # Position already closed (SL hit instantly)
-                            logger.info(f"[monitor] Entry filled but no position for {sym} (SL hit?)")
+                            logger.info(f"[monitor] Entry filled but no position for {sym}")
                             for t in trades:
                                 if t["id"] == order_id and t["status"] == "Open":
                                     t["status"] = "Closed"
                             _save_trades()
-                            # Clean up active position tracking
-                            _active_positions.pop(sym, None)
                             continue
 
-                        is_trade2 = info.get("is_trade2", False)
+                        # This trade's OWN quantity — NOT the whole position.
+                        trade_qty = info.get("qty")
+                        tp_side = info["tp_side"]
 
-                        if is_trade2:
-                            # ═══ Trade 2 filled — upgrade the position ═══
-                            trade1_sl = info.get("trade1_sl", 0)
-                            logger.info(f"[monitor] TRADE 2 filled for {sym}. "
-                                        f"Upgrading: SL→{trade1_sl} (Trade1 SL), TP→{info['tp_price']}")
+                        # Place this trade's independent reduce-only TP limit.
+                        tp_order_id = _place_tp_limit(
+                            session, sym, tp_side, trade_qty, info["tp_price"]
+                        )
+                        # Place this trade's independent reduce-only SL stop.
+                        sl_order_id = _place_sl_stop(
+                            session, sym, tp_side, trade_qty,
+                            info["sl_price"], info["side"]
+                        )
 
-                            # 1. Cancel Trade 1's TP limit order
-                            existing_tp = _tp_orders.get(sym)
-                            if existing_tp:
-                                try:
-                                    logger.info(f"[monitor] Cancelling Trade 1 TP order "
-                                                f"{existing_tp['orderId']} for {sym}")
-                                    bybit_call(session.cancel_order,
-                                               category="linear", symbol=sym,
-                                               orderId=existing_tp["orderId"])
-                                except Exception as e:
-                                    logger.warning(f"[monitor] Cancel Trade1 TP failed {sym}: {e}")
-                                _tp_orders.pop(sym, None)
-
-                            # 2. Update SL on the whole position to Trade 1's original SL
-                            tick_size = get_tick_size(sym)
-                            new_sl = round_price(trade1_sl, tick_size)
-                            try:
-                                logger.info(f"[monitor] Setting position SL for {sym} → {new_sl}")
-                                bybit_call(session.set_trading_stop,
-                                           category="linear", symbol=sym,
-                                           stopLoss=str(new_sl), positionIdx=0)
-                            except Exception as e:
-                                logger.error(f"[monitor] Failed to update SL for {sym}: {e}")
-
-                            # 3. Place new TP at Trade 2's target for FULL position qty
-                            tp_qty = str(pos_size)
-                            tp_order_id = _place_tp_limit(
-                                session, sym, info["tp_side"],
-                                tp_qty, info["tp_price"]
-                            )
-                            if tp_order_id:
-                                _tp_orders[sym] = {
-                                    "orderId": tp_order_id,
-                                    "side": info["tp_side"],
-                                    "qty": tp_qty,
-                                    "price": info["tp_price"],
-                                }
-                                logger.info(f"[monitor] Trade 2 TP placed for {sym}: "
-                                            f"{tp_order_id} @ {info['tp_price']} qty={tp_qty}")
-
-                            # Update trade records with new TP (SL stays at Trade 1's SL)
-                            for t in trades:
-                                if t["ticker"] == sym and t["status"] == "Open":
-                                    t["sl"] = trade1_sl
-                                    t["tp"] = info["tp_price"]
-                            _save_trades()
-
-                            # Mark position as fully set up (both trades in)
-                            if sym in _active_positions:
-                                _active_positions[sym]["trade_num"] = 2
-                                _active_positions[sym]["fully_entered"] = True
-
-                        else:
-                            # ═══ Trade 1 filled — place TP as before ═══
-                            tp_qty = str(pos_size)
-                            tp_order_id = _place_tp_limit(
-                                session, sym, info["tp_side"],
-                                tp_qty, info["tp_price"]
-                            )
-                            if tp_order_id:
-                                _tp_orders[sym] = {
-                                    "orderId": tp_order_id,
-                                    "side": info["tp_side"],
-                                    "qty": tp_qty,
-                                    "price": info["tp_price"],
-                                }
-                                logger.info(f"[monitor] Trade 1 TP placed for {sym}: {tp_order_id}")
+                        _open_trades[order_id] = {
+                            "symbol": sym,
+                            "side": info["side"],
+                            "qty": trade_qty,
+                            "tp_price": info["tp_price"],
+                            "sl_price": info["sl_price"],
+                            "tp_side": tp_side,
+                            "tp_order_id": tp_order_id,
+                            "sl_order_id": sl_order_id,
+                            "trade_uid": info.get("trade_uid"),
+                        }
+                        logger.info(f"[monitor] Trade {info.get('trade_uid')} ({sym}) live: "
+                                    f"TP={tp_order_id} @ {info['tp_price']}, "
+                                    f"SL={sl_order_id} @ {info['sl_price']}, qty={trade_qty}")
                         continue
 
-                    # status == "Unknown" — order might still be processing
                     logger.debug(f"[monitor] Entry {order_id} {sym} status unknown, will retry")
 
-            # ── Cancel orphaned TP orders (SL hit — position gone) ──
-            if _tp_orders:
-                try:
-                    positions = bybit_call(session.get_positions,
-                                           category="linear", settleCoin="USDT")
-                    if positions.get("retCode") == 0:
-                        pos_list = positions.get("result", {}).get("list", [])
-                        open_syms = {p.get("symbol") for p in pos_list
-                                     if float(p.get("size", 0)) > 0}
-                        for sym in [s for s in list(_tp_orders.keys()) if s not in open_syms]:
-                            tp_info = _tp_orders.pop(sym, None)
-                            if tp_info:
-                                try:
-                                    logger.info(f"[monitor] Position gone for {sym}, cancelling TP {tp_info['orderId']}")
-                                    bybit_call(session.cancel_order,
-                                               category="linear", symbol=sym,
-                                               orderId=tp_info["orderId"])
-                                except Exception as e:
-                                    logger.warning(f"[monitor] Cancel TP failed {sym}: {e}")
-                                # Mark trade as Closed
-                                for t in trades:
-                                    if t["ticker"] == sym and t["status"] == "Open":
-                                        t["status"] = "Closed"
-                                # Clean up active position tracking
-                                _active_positions.pop(sym, None)
-                                _save_trades()
-                except Exception as e:
-                    logger.warning(f"[monitor] Orphan check error: {e}")
-
-            # ── Check if TP limit orders themselves got filled ──
-            if _tp_orders:
-                for sym in list(_tp_orders.keys()):
-                    tp_info = _tp_orders.get(sym)
-                    if not tp_info:
+            # ── 2. Watch each live trade's TP/SL orders independently ──
+            if _open_trades:
+                for entry_id in list(_open_trades.keys()):
+                    tr = _open_trades.get(entry_id)
+                    if not tr:
                         continue
-                    tp_status = _check_order_status(session, sym, tp_info["orderId"])
+                    sym = tr["symbol"]
+
+                    tp_status = (_check_order_status(session, sym, tr["tp_order_id"])
+                                 if tr.get("tp_order_id") else "Unknown")
+                    sl_status = (_check_order_status(session, sym, tr["sl_order_id"])
+                                 if tr.get("sl_order_id") else "Unknown")
+
+                    closed_reason = None
                     if tp_status == "Filled":
-                        logger.info(f"[monitor] TP filled for {sym}")
-                        _tp_orders.pop(sym, None)
+                        closed_reason = "TP"
+                    elif sl_status == "Filled":
+                        closed_reason = "SL"
+
+                    if closed_reason:
+                        logger.info(f"[monitor] Trade {tr.get('trade_uid')} ({sym}) "
+                                    f"closed by {closed_reason}")
+                        # Cancel the sibling exit order so it can't touch other trades.
+                        if closed_reason == "TP":
+                            _cancel_order_safe(session, sym, tr.get("sl_order_id"), "SL")
+                        else:
+                            _cancel_order_safe(session, sym, tr.get("tp_order_id"), "TP")
+
                         for t in trades:
-                            if t["ticker"] == sym and t["status"] == "Open":
+                            if t["id"] == entry_id and t["status"] == "Open":
                                 t["status"] = "Closed"
+                                t["closeReason"] = closed_reason
                         _save_trades()
-                    elif tp_status in ("Cancelled", "Rejected"):
-                        logger.info(f"[monitor] TP order {tp_status} for {sym}")
-                        _tp_orders.pop(sym, None)
+                        _open_trades.pop(entry_id, None)
 
             # ── Periodically sync closed PnL (every 60s) ──
             now = time.time()
@@ -715,168 +700,76 @@ def webhook():
         limit_price = round_price(entry, tick_size)
         tp_price = round_price(tp, tick_size)
 
-        # ── Determine if this is Trade 1 (new) or Trade 2 (add to existing) ──
-        existing = _active_positions.get(ticker)
-        is_trade2 = (existing is not None
-                     and existing.get("trade_num") == 1
-                     and existing.get("side") == side)
+        # ═══════════════════════════════════════════════════════════════
+        # INDEPENDENT TRADE — every signal is its own trade with its own
+        # TP and SL. The limit entry is placed WITHOUT a position-level
+        # stopLoss (that would be global to the netted position). Once it
+        # fills, the monitor attaches this trade's own reduce-only TP limit
+        # and reduce-only conditional stop, so multiple simultaneous trades
+        # on the same symbol keep completely separate TP/SL levels.
+        # ═══════════════════════════════════════════════════════════════
+        sl_price = round_price(sl, tick_size)
+        trade_uid = str(data.get("id") or f"{side}_{int(time.time() * 1000)}")
 
-        if is_trade2:
-            # ═══════════════════════════════════════════════════════════
-            # TRADE 2: Second confirmation — add to position
-            # SL moves to Trade 1's entry, TP becomes Trade 2's target
-            # ═══════════════════════════════════════════════════════════
-            trade1_entry = existing["trade1_entry"]
-            trade1_sl = existing["trade1_sl"]
-            logger.info(f"[TRADE2] {ticker}: Adding to position. "
-                        f"Trade1 entry={trade1_entry}, Trade2 entry={limit_price}, "
-                        f"New SL={trade1_sl} (Trade1 SL), New TP={tp_price}")
+        logger.info(f"[ENTRY] {trade_uid} Placing LIMIT {side}: {ticker} "
+                    f"qty={quantity} price={limit_price} tp={tp_price} sl={sl_price}")
+        order = bybit_call(get_session().place_order,
+                           category="linear", symbol=ticker, side=side,
+                           orderType="Limit", qty=str(quantity),
+                           price=str(limit_price), timeInForce="GTC")
+        logger.info(f"[ENTRY] {trade_uid} response: {order}")
 
-            # Place Trade 2 limit entry with SL at Trade 1's original SL
-            sl_for_trade2 = round_price(trade1_sl, tick_size)
-            logger.info(f"[TRADE2] Placing LIMIT {side}: {ticker} qty={quantity} "
-                        f"price={limit_price} sl={sl_for_trade2}")
-            order = bybit_call(get_session().place_order,
-                               category="linear", symbol=ticker, side=side,
-                               orderType="Limit", qty=str(quantity),
-                               price=str(limit_price), stopLoss=str(sl_for_trade2),
-                               timeInForce="GTC")
-            logger.info(f"[TRADE2] Entry response: {order}")
-
-            if order.get("retCode", -1) != 0:
-                error_msg = order.get("retMsg", "Unknown error")
-                logger.error(f"[TRADE2] Entry rejected: {error_msg}")
-                trades.append({
-                    "id": "failed", "ticker": ticker, "side": side,
-                    "entry": limit_price, "tp": tp, "sl": sl_for_trade2,
-                    "quantity": quantity, "leverage": leverage,
-                    "status": "Failed", "pnl": 0.0,
-                    "tradeNum": 2,
-                    "timeframe": matched_tf or "global",
-                    "targetProfit": target_profit,
-                    "timestamp": int(time.time() * 1000), "error": error_msg
-                })
-                _save_trades()
-                return jsonify({"error": error_msg}), 400
-
-            entry_order_id = order["result"].get("orderId", "")
-            tp_side = "Sell" if side == "Buy" else "Buy"
-
-            # Track Trade 2 pending entry — monitor will:
-            #   1. Cancel Trade 1's TP limit
-            #   2. Update SL on the whole position to Trade 1's entry
-            #   3. Place new TP at Trade 2's target for the full combined qty
-            _pending_entries[entry_order_id] = {
-                "symbol": ticker,
-                "tp_side": tp_side,
-                "tp_price": tp_price,
-                "qty": str(quantity),
-                "is_trade2": True,
-                "trade1_entry": trade1_entry,
-                "trade1_sl": existing.get("trade1_sl"),
-                "trade1_qty": existing.get("trade1_qty"),
-            }
-
-            # Update active position tracking
-            _active_positions[ticker]["trade_num"] = 2
-            _active_positions[ticker]["trade2_order_id"] = entry_order_id
-            _active_positions[ticker]["trade2_entry"] = limit_price
-            _active_positions[ticker]["trade2_tp"] = tp_price
-            _active_positions[ticker]["trade2_qty"] = quantity
-
-            logger.info(f"[TRADE2] Pending for {ticker}: after {entry_order_id} fills → "
-                        f"cancel Trade1 TP, set SL={sl_for_trade2}, TP={tp_price}")
-
+        if order.get("retCode", -1) != 0:
+            error_msg = order.get("retMsg", "Unknown error")
+            logger.error(f"[ENTRY] {trade_uid} rejected: {error_msg}")
             trades.append({
-                "id": entry_order_id,
-                "ticker": ticker, "side": side, "entry": limit_price,
-                "tp": tp, "sl": sl_for_trade2, "quantity": quantity,
-                "leverage": leverage, "status": "Open", "pnl": 0.0,
-                "entryType": "limit",
-                "tpType": "limit",
-                "tradeNum": 2,
+                "id": "failed", "tradeUid": trade_uid,
+                "ticker": ticker, "side": side,
+                "entry": limit_price, "tp": tp, "sl": sl,
+                "quantity": quantity, "leverage": leverage,
+                "status": "Failed", "pnl": 0.0,
                 "timeframe": matched_tf or "global",
                 "targetProfit": target_profit,
-                "timestamp": int(time.time() * 1000)
+                "timestamp": int(time.time() * 1000), "error": error_msg
             })
             _save_trades()
-            return jsonify({
-                "status": "success", "order": order,
-                "entryType": "limit", "tpType": "limit",
-                "tradeNum": 2,
-                "note": f"Trade 2 placed. After fill: SL→{sl_for_trade2}, TP→{tp_price}"
-            }), 200
+            return jsonify({"error": error_msg}), 400
 
-        else:
-            # ═══════════════════════════════════════════════════════════
-            # TRADE 1: First confirmation — standard entry
-            # ═══════════════════════════════════════════════════════════
-            logger.info(f"[TRADE1] Placing LIMIT {side}: {ticker} qty={quantity} "
-                        f"price={limit_price} sl={sl}")
-            order = bybit_call(get_session().place_order,
-                               category="linear", symbol=ticker, side=side,
-                               orderType="Limit", qty=str(quantity),
-                               price=str(limit_price), stopLoss=str(sl),
-                               timeInForce="GTC")
-            logger.info(f"[TRADE1] Entry response: {order}")
+        entry_order_id = order["result"].get("orderId", "")
+        tp_side = "Sell" if side == "Buy" else "Buy"
 
-            if order.get("retCode", -1) != 0:
-                error_msg = order.get("retMsg", "Unknown error")
-                logger.error(f"[TRADE1] Entry rejected: {error_msg}")
-                trades.append({
-                    "id": "failed", "ticker": ticker, "side": side,
-                    "entry": limit_price, "tp": tp, "sl": sl,
-                    "quantity": quantity, "leverage": leverage,
-                    "status": "Failed", "pnl": 0.0,
-                    "tradeNum": 1,
-                    "timeframe": matched_tf or "global",
-                    "targetProfit": target_profit,
-                    "timestamp": int(time.time() * 1000), "error": error_msg
-                })
-                _save_trades()
-                return jsonify({"error": error_msg}), 400
+        # Queue this trade — monitor places its own TP + SL once the entry fills.
+        _pending_entries[entry_order_id] = {
+            "symbol": ticker,
+            "side": side,
+            "tp_side": tp_side,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "qty": str(quantity),
+            "trade_uid": trade_uid,
+        }
+        logger.info(f"[ENTRY] {trade_uid} pending: after {entry_order_id} fills → "
+                    f"TP {tp_side} @ {tp_price}, SL @ {sl_price}")
 
-            entry_order_id = order["result"].get("orderId", "")
-            tp_side = "Sell" if side == "Buy" else "Buy"
-            _pending_entries[entry_order_id] = {
-                "symbol": ticker,
-                "tp_side": tp_side,
-                "tp_price": tp_price,
-                "qty": str(quantity),
-            }
-            logger.info(f"[TRADE1] Pending TP for {ticker}: after {entry_order_id} fills → "
-                        f"{tp_side} limit @ {tp_price}")
-
-            # Register as Trade 1 — waiting for potential Trade 2
-            _active_positions[ticker] = {
-                "trade_num": 1,
-                "trade1_entry": limit_price,
-                "trade1_sl": sl,
-                "trade1_tp": tp_price,
-                "trade1_qty": quantity,
-                "trade1_order_id": entry_order_id,
-                "side": side,
-            }
-
-            trades.append({
-                "id": entry_order_id,
-                "ticker": ticker, "side": side, "entry": limit_price,
-                "tp": tp, "sl": sl, "quantity": quantity,
-                "leverage": leverage, "status": "Open", "pnl": 0.0,
-                "entryType": "limit",
-                "tpType": "limit",
-                "tradeNum": 1,
-                "timeframe": matched_tf or "global",
-                "targetProfit": target_profit,
-                "timestamp": int(time.time() * 1000)
-            })
-            _save_trades()
-            return jsonify({
-                "status": "success", "order": order,
-                "entryType": "limit", "tpType": "limit",
-                "tradeNum": 1,
-                "note": "Trade 1 placed. Awaiting Trade 2 confirmation."
-            }), 200
+        trades.append({
+            "id": entry_order_id,
+            "tradeUid": trade_uid,
+            "ticker": ticker, "side": side, "entry": limit_price,
+            "tp": tp, "sl": sl, "quantity": quantity,
+            "leverage": leverage, "status": "Open", "pnl": 0.0,
+            "entryType": "limit",
+            "tpType": "limit",
+            "timeframe": matched_tf or "global",
+            "targetProfit": target_profit,
+            "timestamp": int(time.time() * 1000)
+        })
+        _save_trades()
+        return jsonify({
+            "status": "success", "order": order,
+            "entryType": "limit", "tpType": "limit",
+            "tradeUid": trade_uid,
+            "note": "Independent trade placed. Own TP + SL set on fill."
+        }), 200
 
     except Exception as e:
         logger.exception(f"Webhook error: {e}")
@@ -890,7 +783,10 @@ def get_trades():
 
 @app.route("/api/trades/<trade_id>/target-profit", methods=["PATCH"])
 def update_trade_tp(trade_id):
-    """Update TP for an existing trade by cancelling old TP limit and placing a new one."""
+    """Update the TP for ONE specific trade by cancelling that trade's own TP
+    limit order and placing a new reduce-only TP limit for the same quantity.
+    Only this trade is affected — other trades on the same symbol keep their TP.
+    """
     data = request.json
     new_tp = float(data.get("targetProfit", 0))
     for t in trades:
@@ -900,63 +796,29 @@ def update_trade_tp(trade_id):
             tick_size = get_tick_size(sym)
             new_tp_price = round_price(new_tp, tick_size)
 
-            # Cancel existing TP limit order if any
-            existing_tp = _tp_orders.get(sym)
-            if existing_tp:
-                try:
-                    logger.info(f"Cancelling old TP order {existing_tp['orderId']} for {sym}")
-                    bybit_call(session.cancel_order,
-                               category="linear", symbol=sym,
-                               orderId=existing_tp["orderId"])
-                except Exception as e:
-                    logger.warning(f"Cancel old TP failed for {sym}: {e}")
-                _tp_orders.pop(sym, None)
+            tr = _open_trades.get(trade_id)
+            if not tr:
+                return jsonify({"error": "Trade is not live (no active TP order)"}), 400
 
-            # Determine TP side and qty from position
+            # Cancel this trade's existing TP limit order.
+            _cancel_order_safe(session, sym, tr.get("tp_order_id"), "TP")
+
             try:
-                pos = bybit_call(session.get_positions,
-                                 category="linear", symbol=sym)
-                pos_list = pos.get("result", {}).get("list", [])
-                pos_size = 0.0
-                pos_side = ""
-                for p in pos_list:
-                    s = float(p.get("size", 0))
-                    if s > 0:
-                        pos_size = s
-                        pos_side = p.get("side", "")
-                        break
-
-                if pos_size <= 0:
-                    return jsonify({"error": "No open position found"}), 400
-
-                # TP side is opposite of position side
-                tp_side = "Sell" if pos_side == "Buy" else "Buy"
-                tp_order_id = _place_tp_limit(
-                    session, sym, tp_side, str(pos_size), new_tp_price
+                # Re-place TP for THIS trade's own quantity only.
+                new_tp_order_id = _place_tp_limit(
+                    session, sym, tr["tp_side"], tr["qty"], new_tp_price
                 )
-                if tp_order_id:
-                    _tp_orders[sym] = {
-                        "orderId": tp_order_id,
-                        "side": tp_side,
-                        "qty": str(pos_size),
-                        "price": new_tp_price,
-                    }
+                if not new_tp_order_id:
+                    return jsonify({"error": "Failed to place new TP order"}), 500
+
+                tr["tp_order_id"] = new_tp_order_id
+                tr["tp_price"] = new_tp_price
                 t["tp"] = new_tp
                 _save_trades()
                 return jsonify(t), 200
-
             except Exception as e:
-                logger.error(f"Update TP error for {sym}: {e}")
-                # Fallback: try set_trading_stop
-                try:
-                    bybit_call(session.set_trading_stop,
-                               category="linear", symbol=sym,
-                               takeProfit=str(new_tp_price), positionIdx=0)
-                    t["tp"] = new_tp
-                    _save_trades()
-                    return jsonify(t), 200
-                except Exception as e2:
-                    return jsonify({"error": str(e2)}), 500
+                logger.error(f"Update TP error for {sym} ({trade_id}): {e}")
+                return jsonify({"error": str(e)}), 500
     return jsonify({"error": "Trade not found"}), 404
 
 

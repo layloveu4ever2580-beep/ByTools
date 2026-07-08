@@ -1,11 +1,11 @@
 //@version=6
-strategy("4 EMA Fib Strategy (With Presets + Webhooks)", overlay=true, initial_capital=1000, default_qty_type=strategy.cash, default_qty_value=50, currency=currency.USD)
+strategy("4 EMA Fib Strategy (With Presets + Webhooks)", overlay=true, initial_capital=1000, default_qty_type=strategy.cash, default_qty_value=50, currency=currency.USD, pyramiding=50)
 
 // -----------------------------------------------------------------------------
 // 1. PRESETS & INPUTS
 // -----------------------------------------------------------------------------
 grp_preset = "🔴 1. STRATEGY PRESETS 🔴"
-selected_preset = input.string("Custom (Use Settings Below)", "Select Preset Profile", options=["Custom (Use Settings Below)", "Preset 1: Aggressive (Scalp)", "Preset 2: Balanced (Day)", "Preset 3: Conservative (Swing)"], group=grp_preset)
+selected_preset = input.string("Custom (Use Settings Below)", "Select Preset Profile", options=["Custom (Use Settings Below)", "Preset 1: Aggressive (Scalp)", "Preset 2: Balanced (Day)", "Preset 3: Conservative (Swing)", "Preset 4: Fast Scalp", "Preset 5: Trend Rider", "Preset 6: Wide Swing"], group=grp_preset)
 
 // --- EMA SETTINGS (CUSTOM) ---
 grp_ema = "2. EMA Settings (Custom)"
@@ -82,6 +82,33 @@ else if selected_preset == "Preset 3: Conservative (Swing)"
     calc_fib_tp := 1.838
     calc_fib_sl := -0.285
 
+else if selected_preset == "Preset 4: Fast Scalp"
+    calc_len1 := 9
+    calc_len2 := 21
+    calc_len3 := 55
+    calc_len4 := 100
+    calc_fib_entry := 0.618
+    calc_fib_tp := 1.272
+    calc_fib_sl := -0.236
+
+else if selected_preset == "Preset 5: Trend Rider"
+    calc_len1 := 50
+    calc_len2 := 100
+    calc_len3 := 200
+    calc_len4 := 400
+    calc_fib_entry := 0.786
+    calc_fib_tp := 2.618
+    calc_fib_sl := -0.382
+
+else if selected_preset == "Preset 6: Wide Swing"
+    calc_len1 := 100
+    calc_len2 := 200
+    calc_len3 := 400
+    calc_len4 := 800
+    calc_fib_entry := 0.886
+    calc_fib_tp := 3.618
+    calc_fib_sl := -0.500
+
 // -----------------------------------------------------------------------------
 // 3. LOGIC CALCULATIONS
 // -----------------------------------------------------------------------------
@@ -124,16 +151,22 @@ var int sell_setup_index = 0
 var float pending_buy_tp = na
 var float pending_sell_tp = na
 
+// Track the most recent pending limit-order IDs for smart cancellation
+var string dynamic_long_id = na
+var string dynamic_short_id = na
+
 // -----------------------------------------------------------------------------
 // 5. SMART CANCELLATION
 // -----------------------------------------------------------------------------
 if strategy.position_size == 0
     if not na(pending_buy_tp) and high >= pending_buy_tp
-        strategy.cancel("Long")
+        if not na(dynamic_long_id)
+            strategy.cancel(dynamic_long_id)
         pending_buy_tp := na
         label.new(bar_index, high, "Cancelled\n(Target Hit)", color=color.gray, textcolor=color.white, style=label.style_label_down, size=size.tiny)
     if not na(pending_sell_tp) and low <= pending_sell_tp
-        strategy.cancel("Short")
+        if not na(dynamic_short_id)
+            strategy.cancel(dynamic_short_id)
         pending_sell_tp := na
         label.new(bar_index, low, "Cancelled\n(Target Hit)", color=color.gray, textcolor=color.white, style=label.style_label_up, size=size.tiny)
 
@@ -257,20 +290,25 @@ if buy_confirmed
     float entry_price = fib_entry
     float pos_size = (trade_amt * leverage) / entry_price
 
+    // Unique id per trade so every trade stays fully separate (own TP/SL)
+    // both in the backtester and in the live bot.
+    string trade_id = "Long_" + str.tostring(bar_index)
+    dynamic_long_id := trade_id
     pending_buy_tp := take_profit
     pending_sell_tp := na
 
-    // Build JSON for webhook
+    // Build JSON for webhook — includes the unique id so the bot can place
+    // and manage an independent reduce-only TP + SL for THIS trade only.
     string cleanTicker = str.replace(syminfo.ticker, ".P", "")
-    string webhook_json = '{"ticker":"' + cleanTicker + '","action":"buy","limit":' + str.tostring(entry_price) + ',"entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
+    string webhook_json = '{"id":"' + trade_id + '","ticker":"' + cleanTicker + '","action":"buy","limit":' + str.tostring(entry_price) + ',"entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
 
     // Send webhook alert immediately on confirmation candle close (limit entry signal)
     if enable_webhooks
         alert(webhook_json, alert.freq_once_per_bar_close)
 
-    // Backtest execution (kept for strategy tester accuracy)
-    strategy.entry("Long", strategy.long, qty=pos_size, limit=entry_price, comment=webhook_json)
-    strategy.exit("Exit Long", "Long", limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
+    // Backtest execution — unique from_entry keeps each trade's exit isolated
+    strategy.entry(trade_id, strategy.long, qty=pos_size, limit=entry_price, comment=webhook_json)
+    strategy.exit("Exit_" + trade_id, from_entry=trade_id, limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
 
     line.new(bar_index, entry_price, bar_index + 10, entry_price, color=color.blue, style=line.style_dashed, width=1)
     line.new(bar_index, stop_loss, bar_index + 10, stop_loss, color=color.red, style=line.style_solid, width=1)
@@ -288,20 +326,25 @@ if sell_confirmed
     float entry_price = fib_entry
     float pos_size = (trade_amt * leverage) / entry_price
 
+    // Unique id per trade so every trade stays fully separate (own TP/SL)
+    // both in the backtester and in the live bot.
+    string trade_id = "Short_" + str.tostring(bar_index)
+    dynamic_short_id := trade_id
     pending_sell_tp := take_profit
     pending_buy_tp := na
 
-    // Build JSON for webhook
+    // Build JSON for webhook — includes the unique id so the bot can place
+    // and manage an independent reduce-only TP + SL for THIS trade only.
     string cleanTicker = str.replace(syminfo.ticker, ".P", "")
-    string webhook_json = '{"ticker":"' + cleanTicker + '","action":"sell","limit":' + str.tostring(entry_price) + ',"entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
+    string webhook_json = '{"id":"' + trade_id + '","ticker":"' + cleanTicker + '","action":"sell","limit":' + str.tostring(entry_price) + ',"entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
 
     // Send webhook alert immediately on confirmation candle close (limit entry signal)
     if enable_webhooks
         alert(webhook_json, alert.freq_once_per_bar_close)
 
-    // Backtest execution (kept for strategy tester accuracy)
-    strategy.entry("Short", strategy.short, qty=pos_size, limit=entry_price, comment=webhook_json)
-    strategy.exit("Exit Short", "Short", limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
+    // Backtest execution — unique from_entry keeps each trade's exit isolated
+    strategy.entry(trade_id, strategy.short, qty=pos_size, limit=entry_price, comment=webhook_json)
+    strategy.exit("Exit_" + trade_id, from_entry=trade_id, limit=take_profit, stop=stop_loss, comment_loss="SL Hit", comment_profit="TP Hit")
 
     line.new(bar_index, entry_price, bar_index + 10, entry_price, color=color.yellow, style=line.style_dashed, width=1)
     line.new(bar_index, stop_loss, bar_index + 10, stop_loss, color=color.red, style=line.style_solid, width=1)
@@ -334,6 +377,12 @@ if barstate.islast or barstate.isconfirmed
         mode_name := "P2: Bal."
     else if selected_preset == "Preset 3: Conservative (Swing)"
         mode_name := "P3: Cons."
+    else if selected_preset == "Preset 4: Fast Scalp"
+        mode_name := "P4: Fast"
+    else if selected_preset == "Preset 5: Trend Rider"
+        mode_name := "P5: Trend"
+    else if selected_preset == "Preset 6: Wide Swing"
+        mode_name := "P6: Wide"
 
     table.cell(results_tbl, 0, 0, "MODE", text_color=c_lbl_text, bgcolor=c_mode_bg, text_size=size.small)
     table.cell(results_tbl, 1, 0, mode_name, text_color=c_lbl_text, bgcolor=c_mode_bg, text_size=size.small)
