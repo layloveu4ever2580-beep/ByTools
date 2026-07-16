@@ -199,7 +199,7 @@ else
 bool new_buy_signal = is_above_all and not buy_setup_active and awaiting_buy_reset and not hard_lock_buy
 
 if new_buy_signal
-    if use_alerts
+    if use_alerts and not enable_webhooks
         alert("Bullish Setup Detected at " + str.tostring(close), alert.freq_once_per_bar_close)
     buy_setup_active := true
     buy_setup_high := high
@@ -214,7 +214,7 @@ if buy_setup_active and bar_index > buy_setup_index
             buy_confirmed := true
             buy_setup_active := false
             hard_lock_buy := true
-            if use_alerts
+            if use_alerts and not enable_webhooks
                 alert("LONG CONFIRMED. Entering Limit Order. Price: " + str.tostring(close), alert.freq_once_per_bar_close)
         else
             buy_setup_active := false
@@ -245,7 +245,7 @@ else
 bool new_sell_signal = is_below_all and not sell_setup_active and awaiting_sell_reset and not hard_lock_sell
 
 if new_sell_signal
-    if use_alerts
+    if use_alerts and not enable_webhooks
         alert("Bearish Setup Detected at " + str.tostring(close), alert.freq_once_per_bar_close)
     sell_setup_active := true
     sell_setup_high := high
@@ -260,7 +260,7 @@ if sell_setup_active and bar_index > sell_setup_index
             sell_confirmed := true
             sell_setup_active := false
             hard_lock_sell := true
-            if use_alerts
+            if use_alerts and not enable_webhooks
                 alert("SHORT CONFIRMED. Entering Limit Order. Price: " + str.tostring(close), alert.freq_once_per_bar_close)
         else
             sell_setup_active := false
@@ -268,10 +268,11 @@ if sell_setup_active and bar_index > sell_setup_index
 
 // -----------------------------------------------------------------------------
 // 8. EXECUTION & VISUALS
-//    With "Order fills only" alert mode, the alert Message is sent ONLY when
-//    strategy.entry() limit order actually fills. We embed the JSON in the
-//    strategy.entry() comment field, then use {{strategy.order.comment}} in
-//    the alert Message.
+//    On the confirmation bar's close we fire alert(webhook_json) immediately —
+//    BEFORE any fill. The bot receives the JSON, places the limit entry itself,
+//    and then attaches this trade's own reduce-only TP + SL once the entry
+//    fills. (We still embed the same JSON in the strategy.entry() comment so it
+//    shows up in the backtester's order list.)
 // -----------------------------------------------------------------------------
 plotshape(new_buy_signal and is_green, style=shape.circle, location=location.abovebar, color=color.blue, size=size.tiny, title="Buy Setup")
 plotshape(buy_confirmed and is_green, style=shape.circle, location=location.abovebar, color=color.green, size=size.small, title="Buy Confirm")
@@ -300,7 +301,7 @@ if buy_confirmed
     // Build JSON for webhook — includes the unique id so the bot can place
     // and manage an independent reduce-only TP + SL for THIS trade only.
     string cleanTicker = str.replace(syminfo.ticker, ".P", "")
-    string webhook_json = '{"id":"' + trade_id + '","ticker":"' + cleanTicker + '","action":"buy","limit":' + str.tostring(entry_price) + ',"entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
+    string webhook_json = '{"id":"' + trade_id + '","ticker":"' + cleanTicker + '","action":"buy","limit":' + str.tostring(entry_price, format.mintick) + ',"entry":' + str.tostring(entry_price, format.mintick) + ',"tp":' + str.tostring(take_profit, format.mintick) + ',"sl":' + str.tostring(stop_loss, format.mintick) + '}'
 
     // Send webhook alert immediately on confirmation candle close (limit entry signal)
     if enable_webhooks
@@ -336,7 +337,7 @@ if sell_confirmed
     // Build JSON for webhook — includes the unique id so the bot can place
     // and manage an independent reduce-only TP + SL for THIS trade only.
     string cleanTicker = str.replace(syminfo.ticker, ".P", "")
-    string webhook_json = '{"id":"' + trade_id + '","ticker":"' + cleanTicker + '","action":"sell","limit":' + str.tostring(entry_price) + ',"entry":' + str.tostring(entry_price) + ',"tp":' + str.tostring(take_profit) + ',"sl":' + str.tostring(stop_loss) + '}'
+    string webhook_json = '{"id":"' + trade_id + '","ticker":"' + cleanTicker + '","action":"sell","limit":' + str.tostring(entry_price, format.mintick) + ',"entry":' + str.tostring(entry_price, format.mintick) + ',"tp":' + str.tostring(take_profit, format.mintick) + ',"sl":' + str.tostring(stop_loss, format.mintick) + '}'
 
     // Send webhook alert immediately on confirmation candle close (limit entry signal)
     if enable_webhooks

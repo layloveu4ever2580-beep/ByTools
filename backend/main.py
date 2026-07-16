@@ -102,7 +102,10 @@ def bybit_call(fn, *args, retries=3, **kwargs):
 _symbol_cache = {}
 
 
-def get_symbol_info(symbol):
+def _fetch_symbol_filters(symbol):
+    """Fetch and cache (min_qty, qty_step, tick_size) for a symbol in ONE API
+    call. Previously get_symbol_info and get_tick_size each made a separate
+    get_instruments_info request — doubling the latency on the hot path."""
     if symbol in _symbol_cache:
         return _symbol_cache[symbol]
     try:
@@ -111,18 +114,21 @@ def get_symbol_info(symbol):
         lot_filter = instrument["lotSizeFilter"]
         min_qty = float(lot_filter["minOrderQty"])
         qty_step = float(lot_filter["qtyStep"])
-        _symbol_cache[symbol] = (min_qty, qty_step)
-        return min_qty, qty_step
-    except Exception:
-        return 0.001, 0.001
+        tick_size = float(instrument["priceFilter"]["tickSize"])
+        _symbol_cache[symbol] = (min_qty, qty_step, tick_size)
+        return min_qty, qty_step, tick_size
+    except Exception as e:
+        logger.warning(f"[filters] Failed to fetch instrument info for {symbol}: {e}")
+        return 0.001, 0.001, 0.01
+
+
+def get_symbol_info(symbol):
+    min_qty, qty_step, _ = _fetch_symbol_filters(symbol)
+    return min_qty, qty_step
 
 
 def get_tick_size(symbol):
-    try:
-        info = bybit_call(get_session().get_instruments_info, category="linear", symbol=symbol)
-        return float(info["result"]["list"][0]["priceFilter"]["tickSize"])
-    except Exception:
-        return 0.01
+    return _fetch_symbol_filters(symbol)[2]
 
 
 def round_price(price, tick_size):
@@ -273,7 +279,7 @@ def _place_tp_limit(session, symbol, side, qty, price, retry=True):
 
 
 def _place_sl_stop(session, symbol, side, qty, trigger_price, position_side, retry=True):
-    """Place a reduce-only conditional stop-market order as this trade's SL.
+    """Place a reduce-only conditional stop-LIMIT order as this trade's SL.
 
     Each trade gets its own SL order (instead of a single position-level stop),
     so multiple trades on one symbol keep independent stop levels.
@@ -282,15 +288,31 @@ def _place_sl_stop(session, symbol, side, qty, trigger_price, position_side, ret
     is the entry side ("Buy"/"Sell") used to derive the trigger direction:
       - Long  (Buy):  SL is below → trigger when price falls  → triggerDirection=2
       - Short (Sell): SL is above → trigger when price rises   → triggerDirection=1
+
+    The order is a stop-limit: once triggerPrice is hit, a reduce-only LIMIT
+    order is submitted at `limit_price`. The limit is offset a small buffer
+    beyond the trigger in the fill-favouring direction so it still executes.
     Returns orderId or None.
     """
     trigger_dir = 2 if position_side == "Buy" else 1
-    logger.info(f"[SL] Placing {side} reduce-only stop: {symbol} qty={qty} "
-                f"trigger@{trigger_price} dir={trigger_dir}")
+
+    # Compute the protective limit price with a small slippage buffer so the
+    # stop-limit reliably fills after it triggers.
+    tick = get_tick_size(symbol)
+    trig = float(trigger_price)
+    buffer = max(tick, round_price(trig * 0.001, tick))  # ~0.1%, at least 1 tick
+    if side == "Sell":   # closing a long → sell limit just BELOW trigger
+        limit_price = round_price(trig - buffer, tick)
+    else:                # closing a short → buy limit just ABOVE trigger
+        limit_price = round_price(trig + buffer, tick)
+
+    logger.info(f"[SL] Placing {side} reduce-only stop-limit: {symbol} qty={qty} "
+                f"trigger@{trigger_price} limit@{limit_price} dir={trigger_dir}")
     try:
         sl_ord = bybit_call(session.place_order,
                             category="linear", symbol=symbol,
-                            side=side, orderType="Market", qty=str(qty),
+                            side=side, orderType="Limit", qty=str(qty),
+                            price=str(limit_price),
                             triggerPrice=str(trigger_price), triggerBy="LastPrice",
                             triggerDirection=trigger_dir, reduceOnly=True,
                             timeInForce="GTC")
@@ -641,18 +663,29 @@ def delete_leverage(symbol):
     return jsonify(LEVERAGE_CONFIG), 200
 
 
+# In-memory guard so a retried/duplicated alert doesn't double-fire while the
+# first one is still being processed in the background.
+_inflight_uids = set()
+_inflight_lock = threading.Lock()
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     # No authentication — the webhook is open. Anyone who can reach this
     # endpoint can place trades, so restrict inbound access at the firewall
     # (e.g. allow only TradingView's IPs) if that matters.
+    #
+    # IMPORTANT: TradingView aborts a webhook if the HTTP response takes longer
+    # than a few seconds ("request took too long and timed out"). All the slow
+    # Bybit REST calls (ticker, leverage, instrument info, order placement, each
+    # with retries + backoff) are therefore handed off to a background thread so
+    # we can ACK immediately and delivery never times out.
     try:
         data = request.get_json(silent=True)
         if data is None:
             raw = request.get_data(as_text=True).strip()
             logger.info(f"Raw webhook body: {raw[:500]}")
             if raw.startswith("{"):
-                import json
                 try:
                     data = json.loads(raw)
                 except Exception:
@@ -679,6 +712,39 @@ def webhook():
         if entry <= 0:
             return jsonify({"error": "Missing or invalid entry/limit price"}), 400
 
+        # Fast, in-memory idempotency so retried/duplicated alerts don't
+        # double-fire (TradingView retries a webhook it thinks failed).
+        trade_uid = str(data.get("id") or f"{side}_{int(time.time() * 1000)}")
+        with _inflight_lock:
+            already = (trade_uid in _inflight_uids
+                       or any(p.get("trade_uid") == trade_uid for p in _pending_entries.values())
+                       or any(o.get("trade_uid") == trade_uid for o in _open_trades.values()))
+            if data.get("id") and already:
+                logger.info(f"[ENTRY] Duplicate signal for {trade_uid}, ignoring")
+                return jsonify({"status": "ignored", "reason": "duplicate trade id"}), 200
+            _inflight_uids.add(trade_uid)
+
+        # Hand off the slow Bybit work and ACK TradingView right away.
+        threading.Thread(target=_process_signal, args=(data, trade_uid),
+                         daemon=True).start()
+        return jsonify({"status": "accepted", "tradeUid": trade_uid}), 200
+    except Exception as e:
+        logger.exception(f"Webhook error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def _process_signal(data, trade_uid):
+    """Place the entry order for a validated signal. Runs in a background
+    thread (spawned by /webhook) so TradingView's webhook never times out.
+    Once the entry fills, background_monitor attaches this trade's own
+    reduce-only TP limit and SL stop."""
+    try:
+        ticker = data.get("ticker")
+        entry = float(data.get("limit") or data.get("entry", 0))
+        tp = float(data.get("tp", 0))
+        sl = float(data.get("sl", 0))
+        side = str(data.get("action") or data.get("side", "Buy")).capitalize()
+
         ticker_info = bybit_call(get_session().get_tickers, category="linear", symbol=ticker)
         last_price = float(ticker_info["result"]["list"][0]["lastPrice"])
         logger.info(f"{ticker} last_price={last_price}, entry={entry}, tp={tp}, sl={sl}, side={side}")
@@ -686,7 +752,8 @@ def webhook():
         price_for_calc = entry
         tp_distance = abs(price_for_calc - tp)
         if tp_distance == 0:
-            return jsonify({"error": "TP distance is zero"}), 400
+            logger.error(f"[ENTRY] {trade_uid} TP distance is zero, aborting")
+            return
 
         # Use timeframe-specific target profit if provided in webhook data
         timeframe_key = data.get("timeframe", "").lower().strip()
@@ -713,7 +780,8 @@ def webhook():
         raw_quantity = target_profit / tp_distance
         leverage = LEVERAGE_CONFIG.get(ticker, 10)
 
-        min_qty, qty_step = get_symbol_info(ticker)
+        # Single cached call returns lot filters AND tick size (was two calls).
+        min_qty, qty_step, tick_size = _fetch_symbol_filters(ticker)
         quantity = round_qty(raw_quantity, min_qty, qty_step)
         logger.info(f"qty={quantity} (raw={raw_quantity}, min={min_qty}, step={qty_step})")
 
@@ -724,7 +792,6 @@ def webhook():
         except Exception as e:
             logger.info(f"set_leverage note: {e}")
 
-        tick_size = get_tick_size(ticker)
         limit_price = round_price(entry, tick_size)
         tp_price = round_price(tp, tick_size)
 
@@ -736,17 +803,10 @@ def webhook():
         # and reduce-only conditional stop, so multiple simultaneous trades
         # on the same symbol keep completely separate TP/SL levels.
         # ═══════════════════════════════════════════════════════════════
+        # Entry, TP and SL prices all come straight from the TradingView alert
+        # (the strategy already applies its own Risk:Reward). The bot just
+        # places them as this trade's own reduce-only orders.
         sl_price = round_price(sl, tick_size)
-        trade_uid = str(data.get("id") or f"{side}_{int(time.time() * 1000)}")
-
-        # Idempotency: ignore a repeated signal for a trade id we're already
-        # handling (TradingView can retry or re-fire the same alert).
-        if data.get("id"):
-            already = (any(p.get("trade_uid") == trade_uid for p in _pending_entries.values())
-                       or any(o.get("trade_uid") == trade_uid for o in _open_trades.values()))
-            if already:
-                logger.info(f"[ENTRY] Duplicate signal for {trade_uid}, ignoring")
-                return jsonify({"status": "ignored", "reason": "duplicate trade id"}), 200
 
         logger.info(f"[ENTRY] {trade_uid} Placing LIMIT {side}: {ticker} "
                     f"qty={quantity} price={limit_price} tp={tp_price} sl={sl_price}")
@@ -762,7 +822,7 @@ def webhook():
             trades.append({
                 "id": "failed", "tradeUid": trade_uid,
                 "ticker": ticker, "side": side,
-                "entry": limit_price, "tp": tp, "sl": sl,
+                "entry": limit_price, "tp": tp, "sl": sl_price,
                 "quantity": quantity, "leverage": leverage,
                 "status": "Failed", "pnl": 0.0,
                 "timeframe": matched_tf or "global",
@@ -770,7 +830,7 @@ def webhook():
                 "timestamp": int(time.time() * 1000), "error": error_msg
             })
             _save_trades()
-            return jsonify({"error": error_msg}), 400
+            return
 
         entry_order_id = order["result"].get("orderId", "")
         tp_side = "Sell" if side == "Buy" else "Buy"
@@ -792,7 +852,7 @@ def webhook():
             "id": entry_order_id,
             "tradeUid": trade_uid,
             "ticker": ticker, "side": side, "entry": limit_price,
-            "tp": tp, "sl": sl, "quantity": quantity,
+            "tp": tp, "sl": sl_price, "quantity": quantity,
             "leverage": leverage, "status": "Open", "pnl": 0.0,
             "entryType": "limit",
             "tpType": "limit",
@@ -801,16 +861,14 @@ def webhook():
             "timestamp": int(time.time() * 1000)
         })
         _save_trades()
-        return jsonify({
-            "status": "success", "order": order,
-            "entryType": "limit", "tpType": "limit",
-            "tradeUid": trade_uid,
-            "note": "Independent trade placed. Own TP + SL set on fill."
-        }), 200
+        logger.info(f"[ENTRY] {trade_uid} accepted — independent TP + SL will "
+                    f"attach automatically once the entry fills.")
 
     except Exception as e:
-        logger.exception(f"Webhook error: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.exception(f"[ENTRY] {trade_uid} processing error: {e}")
+    finally:
+        with _inflight_lock:
+            _inflight_uids.discard(trade_uid)
 
 
 @app.route("/api/trades", methods=["GET"])
