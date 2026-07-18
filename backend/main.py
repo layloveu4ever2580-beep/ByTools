@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import queue
 import logging
 import threading
 from flask import Flask, request, jsonify, send_from_directory
@@ -348,7 +349,7 @@ def _cancel_order_safe(session, symbol, order_id, tag=""):
 
 
 def background_monitor():
-    """Background loop every 3s:
+    """Background loop every 5s:
     1. Check pending entries — if filled, place TP reduce-only limit
     2. Cancel orphaned TP orders when SL hits (position gone)
     3. Periodically sync closed PnL from Bybit (every 60s)
@@ -356,7 +357,9 @@ def background_monitor():
     _last_pnl_sync = 0
     while True:
         try:
-            time.sleep(3)
+            # 5s (was 3s) — lighter Bybit polling frees the single vCPU so the
+            # webhook endpoint stays responsive. Fill→TP/SL attach is still fast.
+            time.sleep(5)
             session = get_session()
 
             # ── 1. Check pending entries for fills → place this trade's TP + SL ──
@@ -668,6 +671,14 @@ def delete_leverage(symbol):
 _inflight_uids = set()
 _inflight_lock = threading.Lock()
 
+# Bounded work queue: /webhook only ENQUEUES (instant) and a small fixed pool of
+# worker threads does the slow Bybit calls. This keeps the endpoint responsive
+# even when many alerts fire in the same second on a candle close — a burst no
+# longer spawns an unbounded number of threads that would stall the host and
+# cause TradingView "request took too long" timeouts.
+_signal_queue = queue.Queue()
+_SIGNAL_WORKERS = 3
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -724,9 +735,8 @@ def webhook():
                 return jsonify({"status": "ignored", "reason": "duplicate trade id"}), 200
             _inflight_uids.add(trade_uid)
 
-        # Hand off the slow Bybit work and ACK TradingView right away.
-        threading.Thread(target=_process_signal, args=(data, trade_uid),
-                         daemon=True).start()
+        # Hand off the slow Bybit work to the worker pool and ACK immediately.
+        _signal_queue.put((data, trade_uid))
         return jsonify({"status": "accepted", "tradeUid": trade_uid}), 200
     except Exception as e:
         logger.exception(f"Webhook error: {e}")
@@ -869,6 +879,23 @@ def _process_signal(data, trade_uid):
     finally:
         with _inflight_lock:
             _inflight_uids.discard(trade_uid)
+
+
+def _signal_worker():
+    """Drain the signal queue and place orders with bounded concurrency."""
+    while True:
+        data, trade_uid = _signal_queue.get()
+        try:
+            _process_signal(data, trade_uid)
+        except Exception as e:
+            logger.exception(f"[worker] {trade_uid} failed: {e}")
+        finally:
+            _signal_queue.task_done()
+
+
+# Fixed-size worker pool — bounds thread count/CPU regardless of burst size.
+for _i in range(_SIGNAL_WORKERS):
+    threading.Thread(target=_signal_worker, daemon=True, name=f"signal-worker-{_i}").start()
 
 
 @app.route("/api/trades", methods=["GET"])

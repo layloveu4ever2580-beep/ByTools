@@ -1,5 +1,9 @@
 //@version=6
-strategy("4 EMA Fib Strategy (With Presets + Webhooks)", overlay=true, initial_capital=1000, default_qty_type=strategy.cash, default_qty_value=50, currency=currency.USD, pyramiding=50)
+// commission_value 0.055% ≈ Bybit USDT-perp taker fee (conservative: charged on
+// every entry AND exit). slippage 2 ticks models real fill drift. Together these
+// make the backtest's net profit / win rate reflect live costs instead of ideal
+// zero-cost fills. Adjust to your actual fee tier if you're a maker/VIP.
+strategy("4 EMA Fib Strategy (With Presets + Webhooks)", overlay=true, initial_capital=1000, default_qty_type=strategy.cash, default_qty_value=50, currency=currency.USD, pyramiding=50, commission_type=strategy.commission.percent, commission_value=0.055, slippage=2)
 
 // -----------------------------------------------------------------------------
 // 1. PRESETS & INPUTS
@@ -55,59 +59,60 @@ float calc_fib_entry = in_fib_entry
 float calc_fib_tp = in_fib_tp
 float calc_fib_sl = in_fib_sl
 
+
 if selected_preset == "Preset 1: Aggressive (Scalp)"
-    calc_len1 := 306
-    calc_len2 := 350
-    calc_len3 := 500
-    calc_len4 := 530
-    calc_fib_entry := 0.746
-    calc_fib_tp := 1.908
-    calc_fib_sl := -0.315
+    calc_len1 := 40 
+    calc_len2 := 74
+    calc_len3 := 298
+    calc_len4 := 1378
+    calc_fib_entry := 0.886
+    calc_fib_tp := 9.458
+    calc_fib_sl := -0.995
 
 else if selected_preset == "Preset 2: Balanced (Day)"
-    calc_len1 := 293
-    calc_len2 := 300
-    calc_len3 := 800
-    calc_len4 := 900
-    calc_fib_entry := 0.726
-    calc_fib_tp := 1.708
-    calc_fib_sl := -0.175
+    calc_len1 := 18
+    calc_len2 := 136
+    calc_len3 := 500
+    calc_len4 := 2000
+    calc_fib_entry := 0.906
+    calc_fib_tp := 9.158
+    calc_fib_sl := -0.945
 
 else if selected_preset == "Preset 3: Conservative (Swing)"
-    calc_len1 := 288
-    calc_len2 := 300
-    calc_len3 := 600
-    calc_len4 := 820
-    calc_fib_entry := 0.766
-    calc_fib_tp := 1.838
-    calc_fib_sl := -0.285
+    calc_len1 := 23
+    calc_len2 := 67
+    calc_len3 := 341
+    calc_len4 := 2322
+    calc_fib_entry := 0.866
+    calc_fib_tp := 9.168
+    calc_fib_sl := -0.925
 
 else if selected_preset == "Preset 4: Fast Scalp"
-    calc_len1 := 9
-    calc_len2 := 21
-    calc_len3 := 55
-    calc_len4 := 100
-    calc_fib_entry := 0.618
-    calc_fib_tp := 1.272
-    calc_fib_sl := -0.236
+    calc_len1 := 19
+    calc_len2 := 42
+    calc_len3 := 230
+    calc_len4 := 1990
+    calc_fib_entry := 0.786
+    calc_fib_tp := 9.538
+    calc_fib_sl := -0.855
 
 else if selected_preset == "Preset 5: Trend Rider"
-    calc_len1 := 50
-    calc_len2 := 100
-    calc_len3 := 200
-    calc_len4 := 400
-    calc_fib_entry := 0.786
-    calc_fib_tp := 2.618
-    calc_fib_sl := -0.382
+    calc_len1 := 9
+    calc_len2 := 73
+    calc_len3 := 352
+    calc_len4 := 2010
+    calc_fib_entry := 0.966
+    calc_fib_tp := 9.378
+    calc_fib_sl := -0.665
 
 else if selected_preset == "Preset 6: Wide Swing"
-    calc_len1 := 100
-    calc_len2 := 200
-    calc_len3 := 400
-    calc_len4 := 800
-    calc_fib_entry := 0.886
-    calc_fib_tp := 3.618
-    calc_fib_sl := -0.500
+    calc_len1 := 9
+    calc_len2 := 51
+    calc_len3 := 580
+    calc_len4 := 1450
+    calc_fib_entry := 0.966
+    calc_fib_tp := 9.238
+    calc_fib_sl := -0.995
 
 // -----------------------------------------------------------------------------
 // 3. LOGIC CALCULATIONS
@@ -294,6 +299,11 @@ if buy_confirmed
     // Unique id per trade so every trade stays fully separate (own TP/SL)
     // both in the backtester and in the live bot.
     string trade_id = "Long_" + str.tostring(bar_index)
+    // Cancel any still-unfilled previous long limit so orphaned resting orders
+    // don't pile up and later double-fill at the same level — that stacking of
+    // stale limit orders is what appears as duplicate trades in the list.
+    if not na(dynamic_long_id)
+        strategy.cancel(dynamic_long_id)
     dynamic_long_id := trade_id
     pending_buy_tp := take_profit
     pending_sell_tp := na
@@ -330,6 +340,11 @@ if sell_confirmed
     // Unique id per trade so every trade stays fully separate (own TP/SL)
     // both in the backtester and in the live bot.
     string trade_id = "Short_" + str.tostring(bar_index)
+    // Cancel any still-unfilled previous short limit so orphaned resting orders
+    // don't pile up and later double-fill at the same level — that stacking of
+    // stale limit orders is what appears as duplicate trades in the list.
+    if not na(dynamic_short_id)
+        strategy.cancel(dynamic_short_id)
     dynamic_short_id := trade_id
     pending_sell_tp := take_profit
     pending_buy_tp := na

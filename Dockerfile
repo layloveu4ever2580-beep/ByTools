@@ -36,4 +36,6 @@ EXPOSE 8080
 # IMPORTANT: single worker only. All trade state and the background order
 # monitor live in process memory, so multiple workers would each run their own
 # monitor and clobber trades_history.json. Use threads for concurrency instead.
-CMD ["gunicorn", "main:app", "-b", "0.0.0.0:8080", "--workers", "1", "--threads", "4", "--timeout", "120"]
+# More threads let the instant /webhook ACK absorb a burst of simultaneous
+# alerts at a candle close; the actual order work is done by the signal queue.
+CMD ["gunicorn", "main:app", "-b", "0.0.0.0:8080", "--workers", "1", "--threads", "16", "--timeout", "120"]
